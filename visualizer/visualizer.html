@@ -677,9 +677,14 @@ window.__encodeDirect = async function() {
       throw new Error("WebCodecs VideoEncoder unavailable");
     }
     if (!frames) throw new Error("frames not loaded");
+    try {
+      const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+      window.__glRenderer = dbg
+        ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : "unknown";
+    } catch (e) { window.__glRenderer = "unknown"; }
     const fps = frames.fps || 30;
     const n = frames.spectrum.length;
-    const cfg = {
+    const base = {
       codec: "avc1.640028",
       width: canvas.width,
       height: canvas.height,
@@ -687,7 +692,18 @@ window.__encodeDirect = async function() {
       framerate: fps,
       avc: { format: "annexb" },
     };
-    const support = await VideoEncoder.isConfigSupported(cfg);
+    // Hardware first: without hardwareAcceleration, headless Chromium
+    // silently picks its SOFTWARE encoder (OpenH264) - 1080x1920 software
+    // H.264 is the "ungodly slow" path. Prefer the GPU encoder (Quick
+    // Sync / NVENC / AMF via Media Foundation) and only fall back to the
+    // default config when no hardware encoder answers.
+    let cfg = Object.assign({ hardwareAcceleration: "prefer-hardware" }, base);
+    let support = await VideoEncoder.isConfigSupported(cfg);
+    window.__directHwAccel = !!support.supported;
+    if (!support.supported) {
+      cfg = base;
+      support = await VideoEncoder.isConfigSupported(cfg);
+    }
     if (!support.supported) throw new Error("H.264 annexb config not supported");
 
     let encError = null;

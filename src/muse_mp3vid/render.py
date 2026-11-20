@@ -100,6 +100,15 @@ def _launch_browser(pw, swiftshader: bool):
     args = ["--mute-audio", "--disable-dev-shm-usage"]
     if swiftshader:
         args += ["--enable-unsafe-swiftshader", "--use-angle=swiftshader"]
+    else:
+        # Real hardware: unblock the GPU and the accelerated video encoder
+        # (Media Foundation on Windows). Without these, headless Chromium
+        # software-encodes H.264 no matter what the page requests.
+        args += ["--ignore-gpu-blocklist", "--enable-accelerated-video-encode"]
+        import sys as _sys
+
+        if _sys.platform == "win32":
+            args.append("--use-angle=d3d11")
     return pw.chromium.launch(args=args)
 
 
@@ -168,9 +177,22 @@ def _direct_visual(job_dir: Path, url: str, duration: float, fps: int) -> Path:
 
             deadline = _time.monotonic() + max(300.0, duration * 45.0)
             last_print = 0.0
+            announced = False
             while True:
                 if page.evaluate("window.__directDone === true"):
                     break
+                if not announced and page.evaluate(
+                        "window.__directHwAccel !== undefined"):
+                    hw = page.evaluate("window.__directHwAccel")
+                    renderer = page.evaluate("window.__glRenderer || 'unknown'")
+                    if hw:
+                        print(f"  [render] direct encode: HARDWARE H.264 "
+                              f"(WebGL: {renderer})")
+                    else:
+                        print("  [render] direct encode: SOFTWARE H.264 - no "
+                              f"hardware encoder answered (WebGL: {renderer}); "
+                              "this will be slow")
+                    announced = True
                 now = _time.monotonic()
                 if now > deadline:
                     raise RuntimeError("direct encode timed out")

@@ -1,3 +1,3 @@
 """museMP3Vid: song -> transcription -> best hook -> captions -> WebGL visualizer -> vertical shorts."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
