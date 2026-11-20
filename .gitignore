@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+out/
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.mp4
+*.webm
+!visualizer/
+dist/
+*.egg-info/

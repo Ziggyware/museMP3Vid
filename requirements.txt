@@ -1,0 +1,9 @@
+faster-whisper>=1.0
+numpy>=1.26
+playwright>=1.44
+# System dependency (not pip): ffmpeg + ffprobe on PATH.
+#   Windows:  winget install Gyan.FFmpeg
+#   macOS:    brew install ffmpeg
+#   Linux:    sudo apt install ffmpeg
+# After pip install, one-time browser fetch for the WebGL renderer:
+#   python -m playwright install chromium
