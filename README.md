@@ -21,11 +21,12 @@ Export TikTok/Reels/Shorts  (1080×1920 H.264/AAC, one file per platform)
 ## Install
 
 ```powershell
-# Windows (run from the repo root)
+# Windows (run from the repo root; note the .\ prefix - PowerShell
+# will not run executables from a bare relative path)
 winget install Gyan.FFmpeg          # ffmpeg + ffprobe on PATH
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python -m playwright install chromium
+.\.venv\Scripts\pip install -r requirements.txt   # also installs muse-mp3vid itself (-e .)
+.\.venv\Scripts\python -m playwright install chromium
 ```
 
 Linux/macOS: install ffmpeg via your package manager, then the same pip steps.
@@ -33,7 +34,7 @@ Linux/macOS: install ffmpeg via your package manager, then the same pip steps.
 ## Usage
 
 ```powershell
-.venv\Scripts\muse-mp3vid "My Song.mp3"
+.\.venv\Scripts\muse-mp3vid "My Song.mp3"
 ```
 
 Outputs land in `out/<song name>/`:
@@ -113,5 +114,5 @@ tests/            unit tests for the pure stages (no Whisper/ffmpeg needed)
 ## Tests
 
 ```powershell
-.venv\Scripts\python -m unittest discover -s tests -v
+.\.venv\Scripts\python -m unittest discover -s tests -v
 ```
