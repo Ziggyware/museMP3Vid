@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from muse_mp3vid import analyze, captions, hook, theme  # noqa: E402
+from muse_mp3vid import analyze, captions, hook, theme, transcribe  # noqa: E402
 
 
 def _seg(i, start, end, text):
@@ -93,6 +93,14 @@ class CaptionTests(unittest.TestCase):
         cues = captions.build_cues(self._words(), 10.0, 12.5)
         self.assertIn(",680,1", captions.cues_to_ass(cues, margin_v=680))
         self.assertIn(",470,1", captions.cues_to_ass(cues, margin_v=470))
+
+
+class TranscribeCacheTests(unittest.TestCase):
+    def test_local_dir_is_used_as_is(self):
+        self.assertEqual(transcribe.cached_model_path("."), ".")
+
+    def test_uncached_model_returns_none(self):
+        self.assertIsNone(transcribe.cached_model_path("definitely-not-a-real-size-xyz"))
 
 
 class ThemeTests(unittest.TestCase):

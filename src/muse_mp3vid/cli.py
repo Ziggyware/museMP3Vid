@@ -202,7 +202,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-render", action="store_true",
                     help="stop after captions + visualizer data (no video)")
     args = ap.parse_args(argv)
-    return run(args)
+    try:
+        return run(args)
+    except RuntimeError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

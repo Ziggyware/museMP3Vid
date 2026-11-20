@@ -23,6 +23,77 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 WHISPER_SR = 16000
 
+_CONN_MARKERS = ("ConnectError", "10054", "10038", "Connection",
+                 "timed out", "Timeout", "LocalEntryNotFoundError")
+
+
+def cached_model_path(model_size: str) -> str | None:
+    """Local snapshot path if this model is already in the HF cache.
+
+    Some networks reset connections to huggingface.co outright (WinError
+    10054 on the very first API call). When the model is already cached,
+    loading it by path skips the network entirely - no repo_info check,
+    no download attempt, nothing to reset.
+    """
+    if os.path.isdir(model_size):
+        return model_size
+    # Look in the cache directly first: faster-whisper's own download skips
+    # repo metadata files (.gitattributes, README.md), which makes
+    # snapshot_download(local_files_only=True) reject the snapshot as
+    # "incomplete" even though every file Whisper needs is present.
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        repo = Path(HF_HUB_CACHE) / f"models--Systran--faster-whisper-{model_size}"
+        snaps = repo / "snapshots"
+        if snaps.is_dir():
+            candidates = [p for p in snaps.iterdir() if p.is_dir()]
+            ref = repo / "refs" / "main"
+            if ref.exists():
+                want = ref.read_text(encoding="utf-8").strip()
+                candidates.sort(key=lambda p: p.name != want)
+            for snap in candidates:
+                if (snap / "model.bin").exists() and (snap / "config.json").exists():
+                    return str(snap)
+    except Exception:
+        pass
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            f"Systran/faster-whisper-{model_size}", local_files_only=True
+        )
+    except Exception:
+        return None
+
+
+def _load_model(model_size: str, device: str, compute_type: str):
+    """Cache-first WhisperModel load with retries on connection resets."""
+    import time
+
+    from faster_whisper import WhisperModel
+
+    cached = cached_model_path(model_size)
+    if cached:
+        return WhisperModel(cached, device=device, compute_type=compute_type)
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return WhisperModel(model_size, device=device, compute_type=compute_type)
+        except Exception as exc:  # noqa: BLE001 - re-raised with guidance below
+            last_exc = exc
+            if not any(m in str(exc) or m in type(exc).__name__ for m in _CONN_MARKERS):
+                raise
+            if attempt < 2:
+                time.sleep(2 + attempt * 3)
+    raise RuntimeError(
+        f"could not download Whisper model '{model_size}': the connection to "
+        "huggingface.co was reset (this network drops HF connections). "
+        "If you have run another model before, rerun with that one - e.g. "
+        "--model medium - since cached models now load fully offline. "
+        f"Original error: {last_exc}"
+    )
+
 
 def _decode_for_whisper(audio_path: str | Path) -> np.ndarray:
     cmd = [
@@ -54,9 +125,7 @@ def transcribe_audio(
                     "words": [{"start", "end", "word", "probability"}]}]
     }
     """
-    from faster_whisper import WhisperModel
-
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    model = _load_model(model_size, device, compute_type)
     segments_iter, info = model.transcribe(
         _decode_for_whisper(audio_path),
         language=language,
