@@ -102,6 +102,42 @@ class TranscribeCacheTests(unittest.TestCase):
     def test_uncached_model_returns_none(self):
         self.assertIsNone(transcribe.cached_model_path("definitely-not-a-real-size-xyz"))
 
+    def test_segment_coverage(self):
+        segs = [_seg(0, 0.0, 25.0, "a"), _seg(1, 50.0, 75.0, "b")]
+        self.assertAlmostEqual(transcribe.segment_coverage(segs, 100.0), 0.5)
+        self.assertEqual(transcribe.segment_coverage([], 100.0), 0.0)
+        self.assertEqual(transcribe.segment_coverage(segs, 0.0), 0.0)
+
+
+class SectionBoundaryTests(unittest.TestCase):
+    def test_flat_mastered_song_still_gets_sections(self):
+        # loudness-compressed song: no energy swings, no lyric segments -
+        # the phrase grid must still cut the hook into multiple sections
+        rms = [{"t": i * 0.25, "rms": 0.8} for i in range(160)]
+        bounds = theme.section_boundaries([], rms, 0.0, 30.0)
+        self.assertGreaterEqual(len(bounds), 4)
+        self.assertEqual(bounds[0], 0.0)
+
+    def test_energy_jump_becomes_a_boundary(self):
+        rms = [{"t": i * 0.25, "rms": 0.2 if i < 24 else 0.9} for i in range(48)]
+        bounds = theme.section_boundaries([], rms, 0.0, 12.0)
+        self.assertTrue(any(5.0 <= b <= 6.5 for b in bounds), bounds)
+
+
+class PerBandStretchTests(unittest.TestCase):
+    def test_quiet_high_tone_still_moves(self):
+        sr = analyze.SAMPLE_RATE
+        t = np.arange(sr * 2) / sr
+        # loud bass throughout + a quiet high tone that switches on at 1s
+        sig = 0.9 * np.sin(2 * np.pi * 110 * t)
+        sig[sr:] += 0.12 * np.sin(2 * np.pi * 5000 * t[sr:])
+        feats = analyze.frame_features(sig.astype(np.float32), fps=30)
+        spec = np.array(feats["spectrum"])
+        edges = analyze._band_edges(sr)
+        hi_band = int(np.searchsorted(edges, 5000) - 1)
+        self.assertGreater(spec[45:, hi_band].max(), 0.7)
+        self.assertGreater(max(feats["pulse"][30:]), 0.0)
+
 
 class ThemeTests(unittest.TestCase):
     def test_palette_from_pixels_two_colors(self):

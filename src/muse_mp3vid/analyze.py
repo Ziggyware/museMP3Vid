@@ -97,11 +97,29 @@ def frame_features(
     peak = np.percentile(spectrum, 99.5) if spectrum.size else 1.0
     if peak > 0:
         spectrum = np.clip(spectrum / peak, 0.0, 1.0)
+    # Per-band stretch: mastered songs are loudness-compressed, so globally
+    # normalized bands sit pegged near one value and the visual barely moves.
+    # Rescale each band by its own p95 over the window (bands that are
+    # essentially silent keep the global values - no noise amplification).
+    if spectrum.shape[0] > 4:
+        band_p95 = np.percentile(spectrum, 95, axis=0)
+        live = band_p95 > 0.10
+        gain = np.where(live, np.minimum(0.92 / np.maximum(band_p95, 1e-6), 3.0), 1.0)
+        stretched = np.clip(spectrum * gain, 0.0, 1.0)
+        spectrum = np.where(live, stretched, spectrum)
     rms_peak = float(np.percentile(rms, 99.5)) if rms.size else 1.0
     if rms_peak > 0:
         rms = np.clip(rms / rms_peak, 0.0, 1.0)
 
+    # Beat pulse from RMS jumps AND spectral flux - flux keeps reacting on
+    # compressed masters where loudness itself hardly changes.
     pulse = _beat_pulse(rms, fps)
+    if spectrum.shape[0] > 4:
+        flux = np.maximum(np.diff(spectrum, axis=0, prepend=spectrum[:1]), 0.0).mean(axis=1)
+        fpeak = np.percentile(flux, 99.5)
+        if fpeak > 0:
+            flux = np.clip(flux / fpeak, 0.0, 1.0)
+        pulse = np.maximum(pulse, _beat_pulse(flux, fps, thresh_k=0.5))
     return {
         "fps": fps,
         "bands": bands,
@@ -112,14 +130,15 @@ def frame_features(
     }
 
 
-def _beat_pulse(rms: np.ndarray, fps: int) -> np.ndarray:
-    """Crude onset pulse: decaying spikes where RMS jumps (kick/onset proxy)."""
+def _beat_pulse(rms: np.ndarray, fps: int, thresh_k: float = 1.0) -> np.ndarray:
+    """Crude onset pulse: decaying spikes where the signal jumps
+    (kick/onset proxy; also used on spectral flux)."""
     pulse = np.zeros_like(rms)
     if len(rms) < 3:
         return pulse
     smooth = np.convolve(rms, np.ones(3) / 3, mode="same")
     onset = np.maximum(np.diff(smooth, prepend=smooth[0]), 0.0)
-    thresh = onset.mean() + onset.std()
+    thresh = onset.mean() + thresh_k * onset.std()
     last = -10**9
     min_gap = int(0.24 * fps)
     for i in range(len(rms)):

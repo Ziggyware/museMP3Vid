@@ -269,23 +269,32 @@ def section_boundaries(
     max_sections: int = 5,
 ) -> list[float]:
     """Section start times relative to the hook start, always beginning at 0.
-    Boundaries come from lyric segment starts inside the hook plus strong
-    energy change points, thinned to >= min_len apart."""
+
+    Boundaries come from lyric segment starts inside the hook plus energy
+    change points measured on the hook's OWN loudness (a mastered song is
+    flat across its whole length, so whole-song thresholds starve). If
+    that still yields too few sections, fall back to an even phrase grid
+    (~5.5s per section, snapped to nearby segment starts): a hook of 10s+
+    ALWAYS gets multiple effects, never one static scene.
+    """
     length = hook_end - hook_start
     if length < min_len * 2:
         return [0.0]
     points = {0.0}
+    seg_starts = []
     for s in segments:
         rel = s["start"] - hook_start
         if 0.5 < rel < length - 0.5:
             points.add(round(rel, 3))
-    if len(rms) > 8:
-        vals = np.array([p["rms"] for p in rms])
+            seg_starts.append(round(rel, 3))
+    local = [p for p in rms if hook_start <= p["t"] < hook_end]
+    if len(local) > 8:
+        vals = np.array([p["rms"] for p in local])
         diffs = np.abs(np.diff(vals))
-        thresh = diffs.mean() + 1.5 * diffs.std()
+        thresh = max(float(np.percentile(diffs, 70)), 0.02)
         for i in np.argsort(diffs)[::-1][:8]:
-            if diffs[i] > thresh:
-                rel = rms[i]["t"] - hook_start
+            if diffs[i] >= thresh:
+                rel = local[i]["t"] - hook_start
                 if 0.5 < rel < length - 0.5:
                     points.add(round(float(rel), 3))
     ordered = sorted(points)
@@ -294,12 +303,24 @@ def section_boundaries(
         if p - kept[-1] >= min_len:
             kept.append(p)
     if len(kept) > max_sections:
-        # keep the strongest spread: first, last-ish, evenly sampled
         idx = np.linspace(0, len(kept) - 1, max_sections).round().astype(int)
         kept = [kept[i] for i in sorted(set(idx))]
-    # final section must have room to play
     if len(kept) > 1 and length - kept[-1] < min_len:
         kept.pop()
+    # Guarantee: enough sections for the hook's length. Real boundaries are
+    # kept; an even phrase grid tops the count up to the target.
+    if length >= 10.0:
+        target = min(max_sections, max(2, int(length // 5.5)))
+        if len(kept) < target:
+            for k in range(1, target):
+                g = round(k * length / target, 3)
+                near = [s for s in seg_starts if abs(s - g) <= 1.2]
+                cand = near[0] if near else g
+                if all(abs(cand - e) >= min_len for e in kept):
+                    kept.append(cand)
+                    if len(kept) >= target:
+                        break
+            kept.sort()
     return kept
 
 

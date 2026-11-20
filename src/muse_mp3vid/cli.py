@@ -127,6 +127,10 @@ def run(args: argparse.Namespace) -> int:
     words = flatten_words(transcript)
     cues = captions_mod.build_cues(words, chosen["start"], chosen["end"],
                                    max_words=args.caption_words)
+    if not cues:
+        _log("captions", "WARNING: no lyric words inside the chosen hook - "
+                         "the videos will have no captions (instrumental "
+                         "stretch, or the transcription heard no singing)")
     (out_dir / "captions.srt").write_text(captions_mod.cues_to_srt(cues), encoding="utf-8")
     (out_dir / "captions.ass").write_text(captions_mod.cues_to_ass(cues), encoding="utf-8")
     for platform in platforms:
@@ -165,6 +169,7 @@ def run(args: argparse.Namespace) -> int:
         stem, out_dir, out_dir,
         duration=chosen["end"] - chosen["start"],
         platforms=platforms, fps=args.fps, frames_mode=not args.record,
+        workers=args.render_workers, direct=not args.no_direct,
     )
     for path in results:
         _log("export", str(path))
@@ -199,6 +204,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--record", action="store_true",
                     help="render via real-time MediaRecorder capture (needs a GPU-fast "
                          "machine; default is exact per-frame screenshots)")
+    ap.add_argument("--render-workers", type=int, default=3,
+                    help="parallel browsers capturing frames (default: 3)")
+    ap.add_argument("--no-direct", action="store_true",
+                    help="skip the WebCodecs direct-to-video encode and use "
+                         "per-frame screenshot capture instead")
     ap.add_argument("--no-render", action="store_true",
                     help="stop after captions + visualizer data (no video)")
     args = ap.parse_args(argv)

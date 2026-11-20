@@ -69,7 +69,16 @@ Outputs land in `out/<song name>/`:
 --no-cover           ignore cover art entirely
 --viz auto           auto = a per-section effect schedule derived from
                      the song; or force any single effect by name
+--render-workers 3   parallel browsers for the fallback frame capture
+--no-direct          skip the direct-to-MP4 encode (WebCodecs) and use
+                     per-frame capture instead
 ```
+
+Rendering writes **directly to MP4 by default**: the visualizer encodes
+H.264 in the browser (WebCodecs) as fast as it can draw — not real-time,
+not screenshots — and streams it to disk; ffmpeg only muxes. Per-frame
+screenshot capture remains as the automatic fallback (it reuses frames
+already captured if a run is resumed).
 
 ## Per-song themes: 32 effects, scheduled by the music
 

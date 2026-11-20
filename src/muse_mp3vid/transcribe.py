@@ -108,30 +108,21 @@ def _decode_for_whisper(audio_path: str | Path) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
-def transcribe_audio(
-    audio_path: str | Path,
-    model_size: str = "small",
-    device: str = "cpu",
-    compute_type: str = "int8",
-    language: str | None = None,
-    beam_size: int = 5,
-) -> dict:
-    """Transcribe an audio file. Returns a JSON-serializable dict:
+def segment_coverage(segments: list[dict], duration: float) -> float:
+    """Fraction of the song covered by transcribed segments."""
+    if duration <= 0:
+        return 0.0
+    covered = sum(max(0.0, min(s["end"], duration) - s["start"]) for s in segments)
+    return min(1.0, covered / duration)
 
-    {
-      "language": str, "language_probability": float, "duration": float,
-      "model": str,
-      "segments": [{"id", "start", "end", "text",
-                    "words": [{"start", "end", "word", "probability"}]}]
-    }
-    """
-    model = _load_model(model_size, device, compute_type)
+
+def _transcribe_once(model, samples, language, beam_size, vad_filter):
     segments_iter, info = model.transcribe(
-        _decode_for_whisper(audio_path),
+        samples,
         language=language,
         beam_size=beam_size,
         word_timestamps=True,
-        vad_filter=True,
+        vad_filter=vad_filter,
     )
     segments = []
     for seg in segments_iter:
@@ -153,11 +144,53 @@ def transcribe_audio(
                 "words": words,
             }
         )
+    return segments, info
+
+
+def transcribe_audio(
+    audio_path: str | Path,
+    model_size: str = "small",
+    device: str = "cpu",
+    compute_type: str = "int8",
+    language: str | None = None,
+    beam_size: int = 5,
+) -> dict:
+    """Transcribe an audio file. Returns a JSON-serializable dict:
+
+    {
+      "language": str, "language_probability": float, "duration": float,
+      "model": str,
+      "segments": [{"id", "start", "end", "text",
+                    "words": [{"start", "end", "word", "probability"}]}]
+    }
+
+    faster-whisper's VAD is tuned for speech and can strip sung vocals out
+    of a song entirely (near-empty transcript -> no captions, no sections).
+    If the VAD pass covers < 25% of a song-length file, retry without VAD
+    and keep whichever pass heard more of the song.
+    """
+    model = _load_model(model_size, device, compute_type)
+    samples = _decode_for_whisper(audio_path)
+    segments, info = _transcribe_once(model, samples, language, beam_size, True)
+    duration = float(info.duration)
+    coverage = segment_coverage(segments, duration)
+    vad_fallback = False
+    if duration >= 20.0 and coverage < 0.25:
+        print(f"  [transcribe] VAD pass covered only {coverage:.0%} of the song; "
+              "retrying without VAD (VAD strips sung vocals)...")
+        segments2, info2 = _transcribe_once(model, samples, language, beam_size, False)
+        coverage2 = segment_coverage(segments2, float(info2.duration))
+        if coverage2 > coverage:
+            segments, info, coverage = segments2, info2, coverage2
+            vad_fallback = True
+        print(f"  [transcribe] no-VAD coverage {coverage2:.0%}; "
+              f"using {'no-VAD' if vad_fallback else 'VAD'} pass")
     return {
         "language": info.language,
         "language_probability": round(info.language_probability, 4),
         "duration": round(info.duration, 3),
         "model": model_size,
+        "vad_fallback": vad_fallback,
         "segments": segments,
     }
 

@@ -662,6 +662,81 @@ window.__record = function(seconds) {
   });
 };
 
+/* Direct-to-video encode (WebCodecs): the page encodes H.264 itself, as
+   fast as it can draw (NOT real-time), and streams each chunk to the local
+   server via POST /chunk in order. The caller muxes the annexb stream into
+   an MP4 with no re-encode. Any failure lands in __directError and still
+   sets __directDone so the caller falls back to frame capture. */
+window.__directDone = false;
+window.__directError = null;
+window.__directBytes = 0;
+
+window.__encodeDirect = async function() {
+  try {
+    if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
+      throw new Error("WebCodecs VideoEncoder unavailable");
+    }
+    if (!frames) throw new Error("frames not loaded");
+    const fps = frames.fps || 30;
+    const n = frames.spectrum.length;
+    const cfg = {
+      codec: "avc1.640028",
+      width: canvas.width,
+      height: canvas.height,
+      bitrate: 10_000_000,
+      framerate: fps,
+      avc: { format: "annexb" },
+    };
+    const support = await VideoEncoder.isConfigSupported(cfg);
+    if (!support.supported) throw new Error("H.264 annexb config not supported");
+
+    let encError = null;
+    // POSTs are serialized through this chain so chunks hit the server
+    // strictly in encode order, each one awaited before the next is sent.
+    let postChain = Promise.resolve();
+    const encoder = new VideoEncoder({
+      output: (chunk) => {
+        const buf = new ArrayBuffer(chunk.byteLength);
+        chunk.copyTo(buf);
+        window.__directBytes += chunk.byteLength;
+        postChain = postChain.then(async () => {
+          const r = await fetch("/chunk", { method: "POST", body: buf });
+          if (!r.ok) throw new Error("chunk POST failed: " + r.status);
+        });
+        postChain.catch((e) => { encError = encError || e; });
+      },
+      error: (e) => { encError = encError || e; },
+    });
+    encoder.configure(cfg);
+
+    const frameDur = Math.round(1e6 / fps);
+    for (let i = 0; i < n; i++) {
+      if (encError) throw encError;
+      while (encoder.encodeQueueSize > 8) {
+        await new Promise((r) => setTimeout(r, 5));
+        if (encError) throw encError;
+      }
+      window.__drawFrame(i);
+      const vf = new VideoFrame(canvas, {
+        timestamp: Math.round(i * 1e6 / fps),
+        duration: frameDur,
+      });
+      try {
+        encoder.encode(vf, { keyFrame: i % 150 === 0 });
+      } finally {
+        vf.close();
+      }
+    }
+    await encoder.flush();
+    await postChain;
+    if (encError) throw encError;
+    encoder.close();
+  } catch (err) {
+    window.__directError = String(err);
+  }
+  window.__directDone = true;
+};
+
 async function initRender() {
   const dataUrl = params.get("data");
   if (!dataUrl) { window.__recordError = "missing data param"; return; }
