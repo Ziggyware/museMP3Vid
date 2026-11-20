@@ -8,10 +8,18 @@ faster-whisper's file path before.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import numpy as np
+
+# HF's Xet storage backend gets its connections reset on some networks
+# (WinError 10054 on the xet-read-token request, then the download dies
+# before any model bytes move). Force the classic HTTPS download path,
+# which is resumable and battle-tested. Must be set before
+# huggingface_hub is imported (it is only imported lazily below).
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 WHISPER_SR = 16000
 
