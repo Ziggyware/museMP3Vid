@@ -41,6 +41,54 @@ const MODE = params.get("mode") || "live";
 if (MODE === "render") document.body.classList.add("render");
 const SHOW_CAPTIONS = params.get("captions") === "1";
 
+/* ---------------- theme (per-song identity) ---------------- */
+const theme = {
+  mode: 0, palette: null, spin: 1.0, glow: 1.05, cover: null,
+};
+function defaultPalette() {
+  // cosine palette sampled into 32 stops, used when no theme is supplied
+  const out = new Uint8Array(32 * 4);
+  for (let i = 0; i < 32; i++) {
+    const t = i / 31;
+    out[i*4]   = Math.round(255 * (0.5 + 0.5 * Math.cos(6.28318 * t)));
+    out[i*4+1] = Math.round(255 * (0.5 + 0.5 * Math.cos(6.28318 * (t + 0.33))));
+    out[i*4+2] = Math.round(255 * (0.5 + 0.5 * Math.cos(6.28318 * (t + 0.67))));
+    out[i*4+3] = 255;
+  }
+  return out;
+}
+function paletteTexture(stops) {
+  const out = new Uint8Array(32 * 4);
+  for (let i = 0; i < 32; i++) {
+    const t = i / 31 * (stops.length - 1);
+    const a = stops[Math.floor(t)], b = stops[Math.min(stops.length - 1, Math.floor(t) + 1)];
+    const f = t - Math.floor(t);
+    for (let c = 0; c < 3; c++) out[i*4+c] = Math.round(255 * (a[c] + (b[c] - a[c]) * f));
+    out[i*4+3] = 255;
+  }
+  return out;
+}
+async function loadTheme() {
+  const url = params.get("theme");
+  if (!url) return null;
+  const resp = await fetch(url);
+  const t = await resp.json();
+  theme.mode = t.mode || 0;
+  theme.spin = t.spin || 1.0;
+  theme.glow = t.glow || 1.05;
+  theme.palette = t.palette || null;
+  return t;
+}
+function loadCoverTexture(name) {
+  return new Promise((resolve) => {
+    if (!name) { resolve(null); return; }
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = name;
+  });
+}
+
 /* ---------------- WebGL setup ---------------- */
 const canvas = document.getElementById("gl");
 const gl = canvas.getContext("webgl", { preserveDrawingBuffer: true, antialias: false });
@@ -54,35 +102,84 @@ void main(){ vUv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }`;
 const FRAG = `
 precision highp float;
 varying vec2 vUv;
-uniform float uTime, uRMS, uPulse;
+uniform float uTime, uRMS, uPulse, uSpin, uGlow, uHasCover;
+uniform int uMode;
 uniform vec2 uRes;
-uniform sampler2D uSpec;
-vec3 palette(float t){
-  return 0.5 + 0.5*cos(6.28318*(t + vec3(0.0,0.33,0.67)));
-}
+uniform sampler2D uSpec, uPal, uCover;
+vec3 pal(float t){ return texture2D(uPal, vec2(clamp(t,0.0,1.0), 0.5)).rgb; }
 float band(float x){ return texture2D(uSpec, vec2(clamp(x,0.001,0.999), 0.5)).r; }
 void main(){
   vec2 uv = vUv*2.0-1.0;
   uv.x *= uRes.x/uRes.y;
   float r = length(uv);
   float a = atan(uv.y, uv.x);
-  float lo = band(0.03), mid = band(0.35), hi = band(0.8);
-  float waves = sin(10.0*r - uTime*2.0 + 6.0*lo)
-              * sin(8.0*uv.x + uTime*1.3 + 3.0*mid)
-              * sin(8.0*uv.y - uTime*1.7);
-  vec3 col = palette(r*0.6 + waves*0.18 + uTime*0.02) * (0.07 + 0.22*lo + 0.10*hi);
   float sector = a/6.28318 + 0.5;
-  float b = band(sector);
+  float lo = band(0.03), mid = band(0.35), hi = band(0.8);
   float inner = 0.30 + 0.05*uPulse;
-  float outer = inner + 0.08 + b*0.55;
-  float bar = smoothstep(inner, inner+0.012, r) * (1.0 - smoothstep(outer-0.03, outer, r));
-  float seg = fract(sector*64.0);
-  float gap = smoothstep(0.0,0.18,seg) * (1.0 - smoothstep(0.82,1.0,seg));
-  col += palette(sector + b*0.35) * bar * gap * (0.30 + b*1.35);
-  float ring = 1.0 - smoothstep(0.0, 0.022, abs(r-inner) - 0.004 - 0.012*uRMS);
-  col += vec3(1.0,0.95,0.8) * ring * (0.35 + 0.65*uPulse);
-  float disc = 1.0 - smoothstep(inner-0.02, inner, r);
-  col += palette(uTime*0.05 + r*1.4) * disc * (0.05 + 0.28*uRMS);
+  vec3 col = vec3(0.0);
+  if (uMode == 0) {
+    // radial: spectrum ring around the cover disc
+    float waves = sin(10.0*r - uTime*2.0 + 6.0*lo)
+                * sin(8.0*uv.x + uTime*1.3 + 3.0*mid)
+                * sin(8.0*uv.y - uTime*1.7);
+    col = pal(r*0.6 + waves*0.18 + uTime*0.02) * (0.07 + 0.22*lo + 0.10*hi);
+    float b = band(sector);
+    float outer = inner + 0.08 + b*0.55;
+    float bar = smoothstep(inner, inner+0.012, r) * (1.0 - smoothstep(outer-0.03, outer, r));
+    float seg = fract(sector*64.0);
+    float gap = smoothstep(0.0,0.18,seg) * (1.0 - smoothstep(0.82,1.0,seg));
+    col += pal(sector + b*0.35) * bar * gap * (0.30 + b*1.35);
+    float ring = 1.0 - smoothstep(0.0, 0.022, abs(r-inner) - 0.004 - 0.012*uRMS);
+    col += vec3(1.0,0.95,0.8) * ring * (0.35 + 0.65*uPulse);
+    float disc = 1.0 - smoothstep(inner-0.02, inner, r);
+    if (uHasCover > 0.5) {
+      vec2 cuv = uv/inner*0.5+0.5;
+      cuv = (cuv-0.5)*(1.0-0.08*uPulse)+0.5;
+      col = mix(col, texture2D(uCover, cuv).rgb * (0.85+0.30*uRMS), disc);
+    } else {
+      col += pal(uTime*0.05 + r*1.4) * disc * (0.05 + 0.28*uRMS);
+    }
+  } else if (uMode == 1) {
+    // tunnel: spectrum-driven rings flowing outward over a dim cover backdrop
+    if (uHasCover > 0.5) col += texture2D(uCover, vUv).rgb * 0.16;
+    float b = band(sector);
+    float flow = 6.28318 * (r*4.0 - uTime*0.7*uSpin);
+    float rings = pow(0.5 + 0.5*sin(flow), 3.0);
+    col += pal(fract(r*1.5 - uTime*0.05*uSpin + b*0.25)) * rings
+         * (0.10 + b*1.1) * (1.0 - smoothstep(0.25, 1.4, r));
+    float core = 1.0 - smoothstep(0.0, 0.30, r);
+    col += pal(uTime*0.03) * core * (0.10 + 0.35*uRMS);
+  } else if (uMode == 2) {
+    // ribbon: three glowing waveform ribbons over a dim cover backdrop
+    if (uHasCover > 0.5) col += texture2D(uCover, vUv).rgb * 0.20;
+    col += pal(uv.y*0.4 + 0.5 + uTime*0.02) * (0.05 + 0.15*lo);
+    float aspect = uRes.x/uRes.y;
+    for (int i = 0; i < 3; i++) {
+      float fi = float(i);
+      float yc = -0.55 + fi*0.55;
+      float bx = uv.x/aspect*0.5 + 0.5;
+      float disp = (band(bx*(0.6+0.2*fi)) - 0.35) * (0.55 - 0.13*fi);
+      float d = abs(uv.y - yc - disp*sin(3.14159*bx + uTime*(0.6+0.3*fi)*uSpin + fi*2.0));
+      float glowLine = exp(-d*d*260.0);
+      col += pal(fi*0.33 + bx*0.4 + uTime*0.03) * glowLine * (0.5 + 0.9*mid + 0.4*uPulse);
+    }
+  } else {
+    // kaleido: 8-fold folded interference, cover disc in the center
+    float segA = 6.28318/8.0;
+    float a2 = abs(mod(a, segA) - segA*0.5);
+    vec2 kuv = vec2(cos(a2), sin(a2))*r;
+    float waves = sin(9.0*kuv.x + uTime*1.4*uSpin) * sin(9.0*kuv.y - uTime*1.1*uSpin);
+    float b = band(fract(r*1.1 - uTime*0.04*uSpin));
+    col = pal(r*0.7 + waves*0.22 + b*0.3) * (0.10 + 0.30*lo + 0.45*b);
+    float disc = 1.0 - smoothstep(inner-0.02, inner, r);
+    if (uHasCover > 0.5) {
+      vec2 cuv = uv/inner*0.5+0.5;
+      col = mix(col, texture2D(uCover, cuv).rgb * (0.85+0.30*uRMS), disc*0.9);
+    }
+    float ring = 1.0 - smoothstep(0.0, 0.02, abs(r-inner) - 0.004);
+    col += vec3(1.0) * ring * 0.25;
+  }
+  col *= uGlow;
   col += uPulse * 0.08 * vec3(0.4,0.8,1.0);
   col *= 1.0 - 0.45*pow(min(r*0.75,1.2), 2.0);
   gl_FragColor = vec4(col, 1.0);
@@ -104,20 +201,34 @@ gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.ST
 const loc = gl.getAttribLocation(prog, "p");
 gl.enableVertexAttribArray(loc);
 gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-const U = {
-  time: gl.getUniformLocation(prog, "uTime"),
-  rms: gl.getUniformLocation(prog, "uRMS"),
-  pulse: gl.getUniformLocation(prog, "uPulse"),
-  res: gl.getUniformLocation(prog, "uRes"),
-  spec: gl.getUniformLocation(prog, "uSpec"),
-};
-const specTex = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, specTex);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const U = {};
+for (const name of ["uTime","uRMS","uPulse","uSpin","uGlow","uHasCover","uMode","uRes","uSpec","uPal","uCover"]) {
+  U[name] = gl.getUniformLocation(prog, name);
+}
+function makeTexture(unit, width, height, data, image) {
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  if (image) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  return tex;
+}
+const specTex = makeTexture(0, 64, 1, new Uint8Array(64 * 4).fill(0), null);
+let palTex = makeTexture(1, 32, 1, defaultPalette(), null);
+let coverTex = null;
 const specBytes = new Uint8Array(64 * 4);
+
+function applyThemeTextures(coverImg) {
+  if (theme.palette) {
+    gl.deleteTexture(palTex);
+    palTex = makeTexture(1, 32, 1, paletteTexture(theme.palette), null);
+  }
+  if (coverImg) coverTex = makeTexture(2, 0, 0, null, coverImg);
+}
 
 function drawFrame(spectrum, rms, pulse, time) {
   for (let i = 0; i < 64; i++) {
@@ -128,11 +239,17 @@ function drawFrame(spectrum, rms, pulse, time) {
   gl.bindTexture(gl.TEXTURE_2D, specTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, specBytes);
   gl.viewport(0, 0, canvas.width, canvas.height);
-  gl.uniform1i(U.spec, 0);
-  gl.uniform1f(U.time, time);
-  gl.uniform1f(U.rms, rms);
-  gl.uniform1f(U.pulse, pulse);
-  gl.uniform2f(U.res, canvas.width, canvas.height);
+  gl.uniform1i(U.uSpec, 0);
+  gl.uniform1i(U.uPal, 1);
+  gl.uniform1i(U.uCover, 2);
+  gl.uniform1f(U.uTime, time);
+  gl.uniform1f(U.uRMS, rms);
+  gl.uniform1f(U.uPulse, pulse);
+  gl.uniform1f(U.uSpin, theme.spin);
+  gl.uniform1f(U.uGlow, theme.glow);
+  gl.uniform1f(U.uHasCover, coverTex ? 1 : 0);
+  gl.uniform1i(U.uMode, theme.mode);
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
@@ -198,6 +315,9 @@ window.__record = function(seconds) {
 async function initRender() {
   const dataUrl = params.get("data");
   if (!dataUrl) { window.__recordError = "missing data param"; return; }
+  const t = await loadTheme();
+  const coverImg = t && t.cover ? await loadCoverTexture(t.cover) : null;
+  applyThemeTextures(coverImg);
   const resp = await fetch(dataUrl);
   frames = await resp.json();
   if (SHOW_CAPTIONS && params.get("capdata")) {
@@ -259,11 +379,17 @@ document.getElementById("file").addEventListener("change", (ev) => {
 
 if (MODE === "render") { initRender(); }
 else {
-  if (params.get("capdata")) {
-    fetch(params.get("capdata")).then(r => r.json()).then(c => { captionCues = c; });
-  }
-  window.__ready = true;
-  requestAnimationFrame(liveLoop);
+  (async () => {
+    const t = await loadTheme();
+    const coverImg = t && t.cover ? await loadCoverTexture(t.cover) : null;
+    applyThemeTextures(coverImg);
+    if (params.get("capdata")) {
+      const r = await fetch(params.get("capdata"));
+      captionCues = await r.json();
+    }
+    window.__ready = true;
+    requestAnimationFrame(liveLoop);
+  })();
 }
 </script>
 </body>

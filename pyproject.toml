@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "muse-mp3vid"
-version = "0.1.0"
+version = "0.2.0"
 description = "Song -> Whisper transcription -> best-hook detection -> captions -> WebGL visualizer -> vertical shorts for TikTok/Reels/Shorts"
 readme = "README.md"
 requires-python = ">=3.10"

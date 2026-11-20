@@ -97,17 +97,18 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Hook,Arial Black,86,&H0000FFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,7,2,2,30,30,560,1
+Style: Hook,Arial Black,86,&H0000FFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,7,2,2,30,30,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
-def cues_to_ass(cues: list[dict]) -> str:
+def cues_to_ass(cues: list[dict], margin_v: int = 560) -> str:
     """ASS with \\kf karaoke sweep: words start white (SecondaryColour) and
-    fill to yellow (PrimaryColour) as they are sung."""
-    lines = [ASS_HEADER]
+    fill to yellow (PrimaryColour) as they are sung. margin_v lifts the
+    captions clear of each platform's UI overlay (safe zone)."""
+    lines = [ASS_HEADER.replace("{margin_v}", str(margin_v))]
     for cue in cues:
         parts = []
         words = cue["words"]

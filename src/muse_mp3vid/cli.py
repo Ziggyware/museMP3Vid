@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
-from . import analyze, captions as captions_mod, hook as hook_mod, render as render_mod
+from . import analyze, captions as captions_mod, hook as hook_mod, render as render_mod, theme as theme_mod
 from .transcribe import flatten_words, load_transcript, save_transcript, transcribe_audio
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -56,6 +57,39 @@ def run(args: argparse.Namespace) -> int:
     samples = analyze.decode_audio(str(song))
     rms = analyze.rms_series(samples)
 
+    platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
+    bad = [p for p in platforms if p not in render_mod.PLATFORM_PRESETS]
+    if bad:
+        print(f"unknown platforms: {bad}", file=sys.stderr)
+        return 2
+
+    # ---- Stage 2b: per-song visual theme (palette / shader mode / cover)
+    coverage = 0.0
+    if duration > 0:
+        covered = sum(max(0.0, min(s["end"], duration) - s["start"])
+                      for s in transcript["segments"])
+        coverage = min(1.0, covered / duration)
+    if args.no_cover:
+        cover_path = None
+    elif args.cover:
+        cover_path = Path(args.cover)
+    else:
+        cover_path = theme_mod.find_cover(song)
+    coarse = analyze.frame_features(samples, fps=2)
+    theme = theme_mod.build_theme(coarse, rms, coverage,
+                                  cover_path=cover_path, viz=args.viz)
+    if cover_path is not None and cover_path.exists():
+        dest = out_dir / cover_path.name
+        if cover_path.resolve() != dest.resolve():
+            shutil.copy2(cover_path, dest)
+        theme["cover"] = cover_path.name
+    else:
+        theme["cover"] = None
+    (out_dir / "theme.json").write_text(json.dumps(theme, indent=2), encoding="utf-8")
+    _log("theme", f"mode={theme['mode_name']} ({theme['mode_reason']}), "
+                  f"palette from {theme['palette_source']}, spin={theme['spin']}, "
+                  f"cover={theme['cover']}")
+
     # ---- Stage 3: best-hook detection
     if args.hook_start is not None:
         start = max(0.0, args.hook_start)
@@ -86,8 +120,13 @@ def run(args: argparse.Namespace) -> int:
                                    max_words=args.caption_words)
     (out_dir / "captions.srt").write_text(captions_mod.cues_to_srt(cues), encoding="utf-8")
     (out_dir / "captions.ass").write_text(captions_mod.cues_to_ass(cues), encoding="utf-8")
+    for platform in platforms:
+        margin = render_mod.PLATFORM_PRESETS[platform]["margin_v"]
+        (out_dir / f"captions_{platform}.ass").write_text(
+            captions_mod.cues_to_ass(cues, margin_v=margin), encoding="utf-8")
     (out_dir / "captions.json").write_text(json.dumps(cues, indent=2), encoding="utf-8")
-    _log("captions", f"{len(cues)} cues -> captions.srt / captions.ass / captions.json")
+    _log("captions", f"{len(cues)} cues -> captions.srt / captions.ass "
+                     f"(+ per-platform safe zones) / captions.json")
 
     # ---- Stage 5: visualizer frame data for the hook window
     frames = analyze.frame_features(samples, fps=args.fps,
@@ -112,11 +151,6 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     # ---- Stages 6-7: render + export
-    platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
-    bad = [p for p in platforms if p not in render_mod.PLATFORM_PRESETS]
-    if bad:
-        print(f"unknown platforms: {bad}", file=sys.stderr)
-        return 2
     _log("render", f"rendering visualizer + exporting {platforms} ...")
     results = render_mod.export_shorts(
         stem, out_dir, out_dir,
@@ -143,6 +177,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hook-start", type=float, default=None,
                     help="override hook start (seconds); skips detection")
     ap.add_argument("--caption-words", type=int, default=4, help="max words per caption cue")
+    ap.add_argument("--cover", default=None,
+                    help="cover art image (default: auto-detect in the song's folder)")
+    ap.add_argument("--no-cover", action="store_true", help="do not use cover art")
+    ap.add_argument("--viz", default="auto",
+                    choices=["auto", "radial", "tunnel", "ribbon", "kaleido"],
+                    help="visualizer mode (default: auto = picked from the song's character)")
     ap.add_argument("--fps", type=int, default=30, help="visualizer frames per second")
     ap.add_argument("--platforms", default="tiktok,reels,shorts",
                     help="comma list: tiktok,reels,shorts")

@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from muse_mp3vid import analyze, captions, hook  # noqa: E402
+from muse_mp3vid import analyze, captions, hook, theme  # noqa: E402
 
 
 def _seg(i, start, end, text):
@@ -88,6 +88,48 @@ class CaptionTests(unittest.TestCase):
         self.assertIn("PlayResX: 1080", ass)
         self.assertIn("{\\kf", ass)
         self.assertIn("Dialogue:", ass)
+
+    def test_ass_margin_per_platform(self):
+        cues = captions.build_cues(self._words(), 10.0, 12.5)
+        self.assertIn(",680,1", captions.cues_to_ass(cues, margin_v=680))
+        self.assertIn(",470,1", captions.cues_to_ass(cues, margin_v=470))
+
+
+class ThemeTests(unittest.TestCase):
+    def test_palette_from_pixels_two_colors(self):
+        img = np.zeros((16, 16, 3), dtype=np.uint8)
+        img[:, :8] = (200, 30, 30)     # red half
+        img[:, 8:] = (30, 30, 200)     # blue half
+        pal = theme.palette_from_pixels(img, n=4)
+        self.assertGreaterEqual(len(pal), 2)
+        reds = [c for c in pal if c[0] > 0.6 and c[1] < 0.3]
+        blues = [c for c in pal if c[2] > 0.6 and c[0] < 0.3]
+        self.assertTrue(reds and blues)
+
+    def test_palette_from_audio_shape(self):
+        pal = theme.palette_from_audio(np.random.RandomState(1).rand(64))
+        self.assertEqual(len(pal), 5)
+        self.assertTrue(all(len(c) == 3 and all(0.0 <= v <= 1.0 for v in c) for c in pal))
+
+    def test_pick_mode_rules(self):
+        bass = {"bass_share": 0.6, "bright_share": 0.1, "onset_rate": 40.0}
+        self.assertEqual(theme.pick_mode(bass, 0.9)[0], "tunnel")
+        dense = {"bass_share": 0.2, "bright_share": 0.3, "onset_rate": 120.0}
+        self.assertEqual(theme.pick_mode(dense, 0.9)[0], "kaleido")
+        sparse = {"bass_share": 0.2, "bright_share": 0.1, "onset_rate": 40.0}
+        self.assertEqual(theme.pick_mode(sparse, 0.1)[0], "ribbon")
+        self.assertEqual(theme.pick_mode(sparse, 0.9)[0], "radial")
+
+    def test_build_theme_deterministic(self):
+        rng = np.random.RandomState(7)
+        coarse = {"fps": 2, "bands": 64, "duration": 60.0,
+                  "spectrum": rng.rand(120, 64).tolist(),
+                  "rms": [0.5] * 120, "pulse": [0.0] * 120}
+        rms = [{"t": i * 0.25, "rms": 0.5} for i in range(240)]
+        t1 = theme.build_theme(coarse, rms, 0.9)
+        t2 = theme.build_theme(coarse, rms, 0.9)
+        self.assertEqual(t1, t2)
+        self.assertIn(t1["mode_name"], theme.MODES)
 
 
 class FeatureTests(unittest.TestCase):

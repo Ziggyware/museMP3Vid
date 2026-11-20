@@ -25,10 +25,13 @@ from pathlib import Path
 
 WIDTH, HEIGHT = 1080, 1920
 
+# All three platforms accept the same 1080x1920 H.264/AAC file; what actually
+# differs is the UI each one draws over the bottom of the frame, so each
+# platform gets its own caption safe-zone (ASS MarginV) and post text.
 PLATFORM_PRESETS = {
-    "tiktok": {"suffix": "tiktok", "label": "TikTok"},
-    "reels": {"suffix": "reels", "label": "Instagram Reels"},
-    "shorts": {"suffix": "shorts", "label": "YouTube Shorts"},
+    "tiktok": {"suffix": "tiktok", "label": "TikTok", "margin_v": 560},
+    "reels": {"suffix": "reels", "label": "Instagram Reels", "margin_v": 680},
+    "shorts": {"suffix": "shorts", "label": "YouTube Shorts", "margin_v": 470},
 }
 
 
@@ -70,7 +73,9 @@ def render_visualizer(job_dir: Path, duration: float, fps: int = 30, frames_mode
 
     frames_meta = json.loads((job_dir / "frames.json").read_text(encoding="utf-8"))
     n_frames = len(frames_meta["spectrum"])
-    url = f"http://127.0.0.1:{{port}}/visualizer.html?mode=render&data=frames.json"
+    url = "http://127.0.0.1:{port}/visualizer.html?mode=render&data=frames.json"
+    if (job_dir / "theme.json").exists():
+        url += "&theme=theme.json"
     with _Server(job_dir) as srv, sync_playwright() as pw:
         browser = pw.chromium.launch(args=[
             "--enable-unsafe-swiftshader",
@@ -152,7 +157,6 @@ def export_shorts(
     """Full render+export. job_dir must contain visualizer.html, frames.json
     and hook_audio.m4a; out_dir receives one mp4 (+ post text) per platform."""
     hook_audio = job_dir / "hook_audio.m4a"
-    ass_path = job_dir / "captions.ass"
     try:
         visual = render_visualizer(job_dir, duration, fps=fps, frames_mode=frames_mode)
     except Exception as exc:  # Playwright/Chromium missing or WebGL failed
@@ -162,6 +166,8 @@ def export_shorts(
     results = []
     for platform in platforms:
         preset = PLATFORM_PRESETS[platform]
+        platform_ass = job_dir / f"captions_{platform}.ass"
+        ass_path = platform_ass if platform_ass.exists() else job_dir / "captions.ass"
         out_path = out_dir / f"{song_stem}_hook_{preset['suffix']}.mp4"
         compose(visual, hook_audio, ass_path, out_path)
         post = out_dir / f"{song_stem}_hook_{preset['suffix']}.post.txt"

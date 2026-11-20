@@ -11,7 +11,7 @@ Best-hook detector           (lyric repetition × energy × vocal coverage)
  ↓
 Generate captions            (SRT + karaoke ASS + JSON)
  ↓
-WebGL visualizer             (audio-reactive shader, deterministic frames)
+WebGL visualizer             (per-song themed shader, deterministic frames)
  ↓
 Render shorts                (headless Chromium capture + ffmpeg)
  ↓
@@ -44,6 +44,7 @@ Outputs land in `out/<song name>/`:
 | `transcript.json` | Whisper segments + word timestamps |
 | `hook.json` | Chosen hook window + ranked alternates, with scores |
 | `captions.srt` / `captions.ass` / `captions.json` | Captions for the hook (ASS = karaoke word-sweep, styled for 1080×1920) |
+| `theme.json` | The song's visual identity: shader mode, palette, spin, cover |
 | `frames.json` | Per-frame spectrum/RMS/beat-pulse data that drives the visualizer |
 | `hook_audio.m4a` | The extracted hook audio |
 | `visualizer.html` / `preview.html` | The WebGL visualizer (see below) |
@@ -64,7 +65,33 @@ Outputs land in `out/<song name>/`:
 --no-render          stop after captions + visualizer data
 --skip-transcribe    reuse transcript.json already in the output dir
 --caption-words 4    max words per caption cue
+--cover art.jpg      cover art (default: auto-detect in the song's folder)
+--no-cover           ignore cover art entirely
+--viz auto           visualizer mode: auto (picked per song), radial,
+                     tunnel, ribbon, kaleido
 ```
+
+## Per-song themes
+
+No two songs get the same video. Each run derives a theme (`theme.json`):
+
+- **Palette** — the dominant colors of the song's cover art (median-cut
+  quantization), or generated from the song's spectral balance when no
+  cover is found.
+- **Mode** — one of four shaders, picked from the audio's character:
+  bass-heavy → `tunnel`, dense + bright → `kaleido`, sparse/instrumental →
+  `ribbon`, otherwise `radial`. Motion speed (`spin`) follows onset density.
+- **Cover** — the cover art itself appears in the visualizer (center disc
+  on radial/kaleido, backdrop on tunnel/ribbon), so every short is branded
+  by its own song.
+
+The derivation is deterministic: same song in, same theme out. Override any
+of it with `--viz`, `--cover`, or `--no-cover`.
+
+Platform exports share one encode (all three platforms accept the same
+1080×1920 H.264/AAC), but each platform's app UI covers a different part of
+the frame — so each export burns its captions at that platform's safe-zone
+height, and the files are no longer identical.
 
 ## How the hook detector scores
 
@@ -104,6 +131,7 @@ src/muse_mp3vid/
   transcribe.py   faster-whisper wrapper (word timestamps)
   analyze.py      ffmpeg decode, RMS series, per-frame spectrum + beat pulse
   hook.py         best-hook detector (pure functions, unit-tested)
+  theme.py        per-song palette / shader mode / cover derivation
   captions.py     cue grouping -> SRT / karaoke ASS / JSON
   render.py       Playwright capture, ffmpeg compose, platform presets
   cli.py          the pipeline as one command
