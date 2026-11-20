@@ -63,7 +63,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"unknown platforms: {bad}", file=sys.stderr)
         return 2
 
-    # ---- Stage 2b: per-song visual theme (palette / shader mode / cover)
+    # ---- Stage 2b: inputs for the visual theme (built after the hook is
+    # chosen, since the effect schedule follows the hook's sections)
     coverage = 0.0
     if duration > 0:
         covered = sum(max(0.0, min(s["end"], duration) - s["start"])
@@ -76,19 +77,6 @@ def run(args: argparse.Namespace) -> int:
     else:
         cover_path = theme_mod.find_cover(song)
     coarse = analyze.frame_features(samples, fps=2)
-    theme = theme_mod.build_theme(coarse, rms, coverage,
-                                  cover_path=cover_path, viz=args.viz)
-    if cover_path is not None and cover_path.exists():
-        dest = out_dir / cover_path.name
-        if cover_path.resolve() != dest.resolve():
-            shutil.copy2(cover_path, dest)
-        theme["cover"] = cover_path.name
-    else:
-        theme["cover"] = None
-    (out_dir / "theme.json").write_text(json.dumps(theme, indent=2), encoding="utf-8")
-    _log("theme", f"mode={theme['mode_name']} ({theme['mode_reason']}), "
-                  f"palette from {theme['palette_source']}, spin={theme['spin']}, "
-                  f"cover={theme['cover']}")
 
     # ---- Stage 3: best-hook detection
     if args.hook_start is not None:
@@ -113,6 +101,27 @@ def run(args: argparse.Namespace) -> int:
                  f"score={chosen['score']} reasons={chosen['reasons']}")
     for alt in candidates[1:]:
         _log("hook", f"  alt {alt['start']:.1f}s -> {alt['end']:.1f}s score={alt['score']}")
+
+    # ---- Stage 3b: per-song visual theme + effect schedule for this hook
+    theme = theme_mod.build_theme(
+        coarse, rms, coverage,
+        cover_path=cover_path, viz=args.viz,
+        hook={"start": chosen["start"], "end": chosen["end"]},
+        segments=transcript["segments"],
+    )
+    if cover_path is not None and cover_path.exists():
+        dest = out_dir / cover_path.name
+        if cover_path.resolve() != dest.resolve():
+            shutil.copy2(cover_path, dest)
+        theme["cover"] = cover_path.name
+    else:
+        theme["cover"] = None
+    (out_dir / "theme.json").write_text(json.dumps(theme, indent=2), encoding="utf-8")
+    _log("theme", f"family={theme['family']} ({theme['mode_reason']}), "
+                  f"palette from {theme['palette_source']}, spin={theme['spin']}, "
+                  f"cover={theme['cover']}")
+    for entry in theme["schedule"]:
+        _log("theme", f"  {entry['start']:5.1f}s-{entry['end']:5.1f}s  {entry['mode_name']}")
 
     # ---- Stage 4: captions
     words = flatten_words(transcript)
@@ -181,8 +190,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="cover art image (default: auto-detect in the song's folder)")
     ap.add_argument("--no-cover", action="store_true", help="do not use cover art")
     ap.add_argument("--viz", default="auto",
-                    choices=["auto", "radial", "tunnel", "ribbon", "kaleido"],
-                    help="visualizer mode (default: auto = picked from the song's character)")
+                    choices=["auto"] + sorted(theme_mod.MODES),
+                    help="force one visualizer effect (default: auto = a per-section "
+                         "effect schedule derived from the song)")
     ap.add_argument("--fps", type=int, default=30, help="visualizer frames per second")
     ap.add_argument("--platforms", default="tiktok,reels,shorts",
                     help="comma list: tiktok,reels,shorts")

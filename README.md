@@ -67,26 +67,45 @@ Outputs land in `out/<song name>/`:
 --caption-words 4    max words per caption cue
 --cover art.jpg      cover art (default: auto-detect in the song's folder)
 --no-cover           ignore cover art entirely
---viz auto           visualizer mode: auto (picked per song), radial,
-                     tunnel, ribbon, kaleido
+--viz auto           auto = a per-section effect schedule derived from
+                     the song; or force any single effect by name
 ```
 
-## Per-song themes
+## Per-song themes: 32 effects, scheduled by the music
 
-No two songs get the same video. Each run derives a theme (`theme.json`):
+No two songs get the same video — and a single video doesn't sit on one
+effect either. Each run derives a theme (`theme.json`):
 
 - **Palette** — the dominant colors of the song's cover art (median-cut
   quantization), or generated from the song's spectral balance when no
   cover is found.
-- **Mode** — one of four shaders, picked from the audio's character:
-  bass-heavy → `tunnel`, dense + bright → `kaleido`, sparse/instrumental →
-  `ribbon`, otherwise `radial`. Motion speed (`spin`) follows onset density.
-- **Cover** — the cover art itself appears in the visualizer (center disc
-  on radial/kaleido, backdrop on tunnel/ribbon), so every short is branded
-  by its own song.
+- **Effect schedule** — the hook is cut into musical sections (lyric
+  segment starts + energy change points), and each section gets its own
+  effect from a catalog of **32 shader modes**, crossfaded at the cuts:
 
-The derivation is deterministic: same song in, same theme out. Override any
-of it with `--viz`, `--cover`, or `--no-cover`.
+  radial, tunnel, ribbon, kaleido, sunburst, vinyl, orbital, mandala,
+  scope, waterfall, terrain, eqbars, ledwall, plasma, voronoi, moire,
+  starfield, spirograph, gridwave, skyline, rings, helix, iris, liquid,
+  glitch, halftone, contour, fire, rain, bubbles, laserfan, gears
+
+- **Music picks the family, the song picks the effects** — bass-heavy
+  songs draw from tunnel/vinyl/fire/rings/laserfan; dense + bright songs
+  from kaleido/glitch/moire/starfield/halftone; sparse songs from
+  ribbon/contour/liquid/bubbles/scope; everything else from the full
+  balanced pool. The specific sequence is seeded by the song's stats
+  (bass share, brightness, onset rate, spectral flux, dynamic range), so
+  different songs get different sequences — deterministically.
+- **Every effect is parameterized by the music** — kaleido fold counts
+  from brightness, sunburst ray counts from onset density, voronoi cell
+  scale from spectral flux, fire intensity from bass weight, waterfall
+  and terrain read the song's actual spectrum history. Motion speed
+  (`spin`) follows onset density throughout.
+- **Cover** — the cover art itself appears inside the effects that have
+  a natural home for it (radial/kaleido/sunburst discs, vinyl label,
+  iris pupil, tunnel/ribbon backdrops).
+
+Force one effect for the whole hook with `--viz <name>`; override the art
+with `--cover` / `--no-cover`.
 
 Platform exports share one encode (all three platforms accept the same
 1080×1920 H.264/AAC), but each platform's app UI covers a different part of

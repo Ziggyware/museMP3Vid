@@ -111,25 +111,56 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(len(pal), 5)
         self.assertTrue(all(len(c) == 3 and all(0.0 <= v <= 1.0 for v in c) for c in pal))
 
-    def test_pick_mode_rules(self):
+    def test_pick_family_rules(self):
         bass = {"bass_share": 0.6, "bright_share": 0.1, "onset_rate": 40.0}
-        self.assertEqual(theme.pick_mode(bass, 0.9)[0], "tunnel")
+        self.assertEqual(theme.pick_family(bass, 0.9)[0], "bass")
         dense = {"bass_share": 0.2, "bright_share": 0.3, "onset_rate": 120.0}
-        self.assertEqual(theme.pick_mode(dense, 0.9)[0], "kaleido")
+        self.assertEqual(theme.pick_family(dense, 0.9)[0], "bright")
         sparse = {"bass_share": 0.2, "bright_share": 0.1, "onset_rate": 40.0}
-        self.assertEqual(theme.pick_mode(sparse, 0.1)[0], "ribbon")
-        self.assertEqual(theme.pick_mode(sparse, 0.9)[0], "radial")
+        self.assertEqual(theme.pick_family(sparse, 0.1)[0], "sparse")
+        self.assertEqual(theme.pick_family(sparse, 0.9)[0], "balanced")
+
+    def test_catalog_is_large_and_contiguous(self):
+        self.assertGreaterEqual(len(theme.MODE_CATALOG), 30)
+        ids = sorted(theme.MODES.values())
+        self.assertEqual(ids, list(range(len(ids))))
+        names = [m["name"] for m in theme.MODE_CATALOG]
+        self.assertEqual(len(names), len(set(names)))
+
+    def _coarse(self, seed=7):
+        rng = np.random.RandomState(seed)
+        return {"fps": 2, "bands": 64, "duration": 60.0,
+                "spectrum": rng.rand(120, 64).tolist(),
+                "rms": [0.5] * 120, "pulse": [0.0] * 120}
 
     def test_build_theme_deterministic(self):
-        rng = np.random.RandomState(7)
-        coarse = {"fps": 2, "bands": 64, "duration": 60.0,
-                  "spectrum": rng.rand(120, 64).tolist(),
-                  "rms": [0.5] * 120, "pulse": [0.0] * 120}
         rms = [{"t": i * 0.25, "rms": 0.5} for i in range(240)]
-        t1 = theme.build_theme(coarse, rms, 0.9)
-        t2 = theme.build_theme(coarse, rms, 0.9)
+        t1 = theme.build_theme(self._coarse(), rms, 0.9)
+        t2 = theme.build_theme(self._coarse(), rms, 0.9)
         self.assertEqual(t1, t2)
         self.assertIn(t1["mode_name"], theme.MODES)
+
+    def test_schedule_sections_for_long_hook(self):
+        rms = [{"t": i * 0.25, "rms": 0.5} for i in range(240)]
+        segs = [_seg(i, s, s + 5.0, f"line {i}") for i, s in
+                enumerate([0.0, 6.0, 12.0, 18.0, 24.0, 30.0])]
+        th = theme.build_theme(self._coarse(), rms, 0.9,
+                               hook={"start": 0.0, "end": 30.0}, segments=segs)
+        sched = th["schedule"]
+        self.assertGreaterEqual(len(sched), 2)
+        self.assertEqual(sched[0]["start"], 0.0)
+        self.assertAlmostEqual(sched[-1]["end"], 30.0)
+        for a, b in zip(sched, sched[1:]):
+            self.assertNotEqual(a["mode_name"], b["mode_name"])
+            self.assertAlmostEqual(a["end"], b["start"])
+        for entry in sched:
+            self.assertEqual(len(entry["params"]), 4)
+
+    def test_schedule_single_for_short_hook(self):
+        rms = [{"t": i * 0.25, "rms": 0.5} for i in range(240)]
+        th = theme.build_theme(self._coarse(), rms, 0.9,
+                               hook={"start": 0.0, "end": 5.0}, segments=[])
+        self.assertEqual(len(th["schedule"]), 1)
 
 
 class FeatureTests(unittest.TestCase):

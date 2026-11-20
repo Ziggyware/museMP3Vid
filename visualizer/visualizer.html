@@ -40,13 +40,14 @@ const params = new URLSearchParams(location.search);
 const MODE = params.get("mode") || "live";
 if (MODE === "render") document.body.classList.add("render");
 const SHOW_CAPTIONS = params.get("captions") === "1";
+const FADE = 0.45; // seconds of crossfade between scheduled effects
 
-/* ---------------- theme (per-song identity) ---------------- */
+/* ---------------- theme (per-song identity + effect schedule) ---------------- */
 const theme = {
-  mode: 0, palette: null, spin: 1.0, glow: 1.05, cover: null,
+  schedule: [{ start: 0, end: 1e9, mode: 0, params: [1, 0.5, 0.3, 0] }],
+  palette: null, spin: 1.0, glow: 1.05, cover: null,
 };
 function defaultPalette() {
-  // cosine palette sampled into 32 stops, used when no theme is supplied
   const out = new Uint8Array(32 * 4);
   for (let i = 0; i < 32; i++) {
     const t = i / 31;
@@ -73,10 +74,13 @@ async function loadTheme() {
   if (!url) return null;
   const resp = await fetch(url);
   const t = await resp.json();
-  theme.mode = t.mode || 0;
   theme.spin = t.spin || 1.0;
   theme.glow = t.glow || 1.05;
   theme.palette = t.palette || null;
+  if (Array.isArray(t.schedule) && t.schedule.length) theme.schedule = t.schedule;
+  else if (typeof t.mode === "number") {
+    theme.schedule = [{ start: 0, end: 1e9, mode: t.mode, params: [theme.spin, 0.5, 0.3, 0] }];
+  }
   return t;
 }
 function loadCoverTexture(name) {
@@ -87,6 +91,18 @@ function loadCoverTexture(name) {
     img.onerror = () => resolve(null);
     img.src = name;
   });
+}
+function scheduleAt(t) {
+  const s = theme.schedule;
+  let i = 0;
+  while (i < s.length - 1 && t >= s[i].end) i++;
+  const cur = s[i], nxt = s[i + 1] || null;
+  let blend = 0;
+  if (nxt && t > cur.end - FADE) {
+    const x = Math.min(1, Math.max(0, (t - (cur.end - FADE)) / FADE));
+    blend = x * x * (3 - 2 * x);
+  }
+  return { cur, nxt, blend };
 }
 
 /* ---------------- WebGL setup ---------------- */
@@ -102,27 +118,44 @@ void main(){ vUv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }`;
 const FRAG = `
 precision highp float;
 varying vec2 vUv;
-uniform float uTime, uRMS, uPulse, uSpin, uGlow, uHasCover;
-uniform int uMode;
+uniform float uTime, uRMS, uPulse, uGlow, uHasCover, uBlend, uFrame, uHistH;
+uniform int uMode, uModeNext;
+uniform vec4 uParams, uParamsNext;
 uniform vec2 uRes;
-uniform sampler2D uSpec, uPal, uCover;
+uniform sampler2D uSpec, uPal, uCover, uHist;
 vec3 pal(float t){ return texture2D(uPal, vec2(clamp(t,0.0,1.0), 0.5)).rgb; }
 float band(float x){ return texture2D(uSpec, vec2(clamp(x,0.001,0.999), 0.5)).r; }
-void main(){
-  vec2 uv = vUv*2.0-1.0;
-  uv.x *= uRes.x/uRes.y;
-  float r = length(uv);
-  float a = atan(uv.y, uv.x);
+float histBand(float x, float ago){
+  float f = clamp(uFrame - ago, 0.0, uHistH - 1.0);
+  return texture2D(uHist, vec2(clamp(x,0.001,0.999), (f + 0.5)/uHistH)).r;
+}
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  f = f*f*(3.0-2.0*f);
+  return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+             mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+}
+float fbm(vec2 p){
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++){ v += a*vnoise(p); p *= 2.03; a *= 0.5; }
+  return v;
+}
+vec3 coverAt(vec2 cuv, float bright){
+  return texture2D(uCover, clamp(cuv, 0.001, 0.999)).rgb * bright;
+}
+
+vec3 shade(int mode, vec4 P, vec2 uv, float r, float a){
+  float aspect = uRes.x/uRes.y;
   float sector = a/6.28318 + 0.5;
+  float bx = uv.x/aspect*0.5 + 0.5;
   float lo = band(0.03), mid = band(0.35), hi = band(0.8);
   float inner = 0.30 + 0.05*uPulse;
+  float t = uTime;
   vec3 col = vec3(0.0);
-  if (uMode == 0) {
-    // radial: spectrum ring around the cover disc
-    float waves = sin(10.0*r - uTime*2.0 + 6.0*lo)
-                * sin(8.0*uv.x + uTime*1.3 + 3.0*mid)
-                * sin(8.0*uv.y - uTime*1.7);
-    col = pal(r*0.6 + waves*0.18 + uTime*0.02) * (0.07 + 0.22*lo + 0.10*hi);
+  if (mode == 0) {            // radial
+    float waves = sin(10.0*r - t*2.0 + 6.0*lo)*sin(8.0*uv.x + t*1.3 + 3.0*mid)*sin(8.0*uv.y - t*1.7);
+    col = pal(r*0.6 + waves*0.18 + t*0.02) * (0.07 + 0.22*lo + 0.10*hi);
     float b = band(sector);
     float outer = inner + 0.08 + b*0.55;
     float bar = smoothstep(inner, inner+0.012, r) * (1.0 - smoothstep(outer-0.03, outer, r));
@@ -133,51 +166,342 @@ void main(){
     col += vec3(1.0,0.95,0.8) * ring * (0.35 + 0.65*uPulse);
     float disc = 1.0 - smoothstep(inner-0.02, inner, r);
     if (uHasCover > 0.5) {
-      vec2 cuv = uv/inner*0.5+0.5;
-      cuv = (cuv-0.5)*(1.0-0.08*uPulse)+0.5;
-      col = mix(col, texture2D(uCover, cuv).rgb * (0.85+0.30*uRMS), disc);
-    } else {
-      col += pal(uTime*0.05 + r*1.4) * disc * (0.05 + 0.28*uRMS);
-    }
-  } else if (uMode == 1) {
-    // tunnel: spectrum-driven rings flowing outward over a dim cover backdrop
-    if (uHasCover > 0.5) col += texture2D(uCover, vUv).rgb * 0.16;
+      vec2 cuv = (uv/inner*0.5+0.5 - 0.5)*(1.0-0.08*uPulse)+0.5;
+      col = mix(col, coverAt(cuv, 0.85+0.30*uRMS), disc);
+    } else col += pal(t*0.05 + r*1.4) * disc * (0.05 + 0.28*uRMS);
+  } else if (mode == 1) {     // tunnel
+    if (uHasCover > 0.5) col += coverAt(vUv, 0.16);
     float b = band(sector);
-    float flow = 6.28318 * (r*4.0 - uTime*0.7*uSpin);
+    float flow = 6.28318 * (r*4.0 - t*0.7*P.x);
     float rings = pow(0.5 + 0.5*sin(flow), 3.0);
-    col += pal(fract(r*1.5 - uTime*0.05*uSpin + b*0.25)) * rings
-         * (0.10 + b*1.1) * (1.0 - smoothstep(0.25, 1.4, r));
+    col += pal(fract(r*1.5 - t*0.05*P.x + b*0.25)) * rings * (0.10 + b*1.1) * (1.0 - smoothstep(0.25, 1.4, r));
     float core = 1.0 - smoothstep(0.0, 0.30, r);
-    col += pal(uTime*0.03) * core * (0.10 + 0.35*uRMS);
-  } else if (uMode == 2) {
-    // ribbon: three glowing waveform ribbons over a dim cover backdrop
-    if (uHasCover > 0.5) col += texture2D(uCover, vUv).rgb * 0.20;
-    col += pal(uv.y*0.4 + 0.5 + uTime*0.02) * (0.05 + 0.15*lo);
-    float aspect = uRes.x/uRes.y;
+    col += pal(t*0.03) * core * (0.10 + 0.35*uRMS);
+  } else if (mode == 2) {     // ribbon
+    if (uHasCover > 0.5) col += coverAt(vUv, 0.20);
+    col += pal(uv.y*0.4 + 0.5 + t*0.02) * (0.05 + 0.15*lo);
     for (int i = 0; i < 3; i++) {
       float fi = float(i);
       float yc = -0.55 + fi*0.55;
-      float bx = uv.x/aspect*0.5 + 0.5;
       float disp = (band(bx*(0.6+0.2*fi)) - 0.35) * (0.55 - 0.13*fi);
-      float d = abs(uv.y - yc - disp*sin(3.14159*bx + uTime*(0.6+0.3*fi)*uSpin + fi*2.0));
-      float glowLine = exp(-d*d*260.0);
-      col += pal(fi*0.33 + bx*0.4 + uTime*0.03) * glowLine * (0.5 + 0.9*mid + 0.4*uPulse);
+      float d = abs(uv.y - yc - disp*sin(3.14159*bx + t*(0.6+0.3*fi)*P.x + fi*2.0));
+      col += pal(fi*0.33 + bx*0.4 + t*0.03) * exp(-d*d*260.0) * (0.5 + 0.9*mid + 0.4*uPulse);
     }
-  } else {
-    // kaleido: 8-fold folded interference, cover disc in the center
-    float segA = 6.28318/8.0;
+  } else if (mode == 3) {     // kaleido
+    float folds = max(3.0, floor(P.x));
+    float segA = 6.28318/folds;
     float a2 = abs(mod(a, segA) - segA*0.5);
     vec2 kuv = vec2(cos(a2), sin(a2))*r;
-    float waves = sin(9.0*kuv.x + uTime*1.4*uSpin) * sin(9.0*kuv.y - uTime*1.1*uSpin);
-    float b = band(fract(r*1.1 - uTime*0.04*uSpin));
+    float waves = sin(9.0*kuv.x + t*1.4*P.y) * sin(9.0*kuv.y - t*1.1*P.y);
+    float b = band(fract(r*1.1 - t*0.04*P.y));
     col = pal(r*0.7 + waves*0.22 + b*0.3) * (0.10 + 0.30*lo + 0.45*b);
     float disc = 1.0 - smoothstep(inner-0.02, inner, r);
-    if (uHasCover > 0.5) {
-      vec2 cuv = uv/inner*0.5+0.5;
-      col = mix(col, texture2D(uCover, cuv).rgb * (0.85+0.30*uRMS), disc*0.9);
-    }
+    if (uHasCover > 0.5) col = mix(col, coverAt(uv/inner*0.5+0.5, 0.85+0.30*uRMS), disc*0.9);
     float ring = 1.0 - smoothstep(0.0, 0.02, abs(r-inner) - 0.004);
     col += vec3(1.0) * ring * 0.25;
+  } else if (mode == 4) {     // sunburst
+    float rays = max(6.0, floor(P.x));
+    float rid = floor(sector*rays);
+    float b = band(rid/rays);
+    float outer = inner + 0.10 + b*0.85;
+    float ray = smoothstep(inner, inner+0.01, r) * (1.0 - smoothstep(outer-0.04, outer, r));
+    float gap = smoothstep(0.0, 0.10, fract(sector*rays)) * (1.0 - smoothstep(0.90, 1.0, fract(sector*rays)));
+    col = pal(rid/rays*0.8 + b*0.3 + t*0.01) * ray * gap * (0.35 + b*1.5);
+    col += pal(r*0.5 - t*0.02) * (0.05 + 0.12*lo) * (1.0 - smoothstep(0.0, 1.2, r));
+    float disc = 1.0 - smoothstep(inner-0.02, inner, r);
+    if (uHasCover > 0.5) col = mix(col, coverAt(uv/inner*0.5+0.5, 0.9), disc);
+    else col += pal(t*0.04) * disc * 0.3;
+  } else if (mode == 5) {     // vinyl
+    float groove = fract(r*P.z*2.2 - t*P.x*0.35);
+    float gb = band(fract(r*1.4 - t*P.x*0.05));
+    float ringBand = smoothstep(0.75, 1.0, groove) * (0.25 + gb*1.1);
+    col = pal(r*0.8 + gb*0.25) * ringBand * (1.0 - smoothstep(0.35, 1.05, r)) * step(0.16, r);
+    float label = 1.0 - smoothstep(0.155, 0.165, r);
+    if (uHasCover > 0.5) col = mix(col, coverAt(uv/0.16*0.5+0.5, 0.85), label);
+    else col += pal(0.5 + t*0.02) * label * 0.5;
+    float tick = pow(0.5 + 0.5*sin(a*64.0), 30.0) * band(sector);
+    col += pal(sector) * tick * smoothstep(0.06, 0.0, abs(r - 1.08)) * 1.4;
+    col += vec3(0.02);
+  } else if (mode == 6) {     // orbital
+    col = pal(r*0.4 + t*0.015) * (0.04 + 0.10*lo);
+    for (int k = 0; k < 5; k++) {
+      float fk = float(k);
+      if (fk >= P.x) break;
+      float rad = 0.22 + fk*0.17;
+      float wob = band(fk/5.0)*0.05*sin(a*3.0 + t*(0.6+0.2*fk) + fk*2.0);
+      float ringD = abs(r - rad - wob);
+      float ring = exp(-ringD*ringD*900.0);
+      float dirn = mod(fk, 2.0)*2.0 - 1.0;
+      float spot = pow(0.5 + 0.5*cos(a - dirn*t*(0.4+0.15*fk)*P.y + fk*1.7), 60.0);
+      float spot2 = pow(0.5 + 0.5*cos(a - dirn*t*(0.4+0.15*fk)*P.y + fk*1.7 + 3.14159), 60.0);
+      col += pal(fk/5.0 + band(fk/5.0)*0.3) * (ring*0.5 + ring*(spot+spot2)*2.2) * (0.4 + band(fk/5.0));
+    }
+    float disc = 1.0 - smoothstep(0.17, 0.19, r);
+    if (uHasCover > 0.5) col = mix(col, coverAt(uv/0.18*0.5+0.5, 0.9), disc);
+  } else if (mode == 7) {     // mandala
+    float petals = max(3.0, floor(P.x));
+    float petal = pow(abs(cos(a*petals*0.5)), 1.4);
+    float rr = r - petal*band(fract(a/3.14159))*0.22;
+    float rings = pow(0.5 + 0.5*sin(rr*36.0 - t*1.2*P.y), 2.0);
+    col = pal(rr*0.9 + petal*0.3 + t*0.02) * rings * (0.15 + 0.55*mid + 0.3*petal);
+    float disc = 1.0 - smoothstep(inner-0.03, inner, r);
+    if (uHasCover > 0.5) col = mix(col, coverAt(uv/inner*0.5+0.5, 0.9), disc*0.92);
+    col += pal(sector + t*0.03) * pow(0.5 + 0.5*sin(a*petals + t*P.y), 8.0) * smoothstep(0.5, 0.0, abs(r - 0.85)) * 0.8;
+  } else if (mode == 8) {     // scope
+    col = pal(0.15) * 0.05;
+    float grid = max(smoothstep(0.02, 0.0, abs(fract(uv.x*4.0)-0.5)-0.48),
+                     smoothstep(0.02, 0.0, abs(fract(uv.y*4.0)-0.5)-0.48));
+    col += pal(0.2) * grid * 0.06;
+    for (int k = 0; k < 3; k++) {
+      float fk = float(k);
+      float w = (band(bx*(0.45+0.22*fk)) - 0.45) * 0.9;
+      float yc = w*sin(6.28318*bx*(1.5+fk) + t*(1.0+0.7*fk)*P.x) + (fk-1.0)*0.45;
+      float d = abs(uv.y - yc);
+      col += pal(fk*0.3 + bx*0.3) * exp(-d*d*700.0) * (0.8 + mid) ;
+      col += pal(fk*0.3) * exp(-d*d*60.0) * 0.12;
+    }
+  } else if (mode == 9) {     // waterfall (spectrum history)
+    float ago = (1.0 - vUv.y) * P.w;
+    float v = histBand(bx, ago);
+    col = pal(v*0.85 + vUv.y*0.25) * v * 1.5;
+    float now = band(bx);
+    col += pal(0.9) * now * smoothstep(0.03, 0.0, vUv.y) * 1.2;
+  } else if (mode == 10) {    // terrain (spectrum history ridges)
+    float z = pow(vUv.y, 1.5);
+    float h = histBand(bx, z * P.w * 2.2);
+    float ridge = smoothstep(0.10, 0.0, abs(fract(z*14.0 + h*2.5) - 0.5) - 0.38);
+    col = pal(z*0.8 + h*0.35) * (h*(1.1 - z*0.6) + ridge*(0.25 + h)) ;
+    col += pal(0.05) * (1.0 - vUv.y) * 0.25 * (0.4 + lo);
+  } else if (mode == 11) {    // eqbars
+    float n = max(8.0, floor(P.x));
+    float bid = floor(bx*n);
+    float b = band(bid/n);
+    float top = -0.88 + b*1.72;
+    float inBar = step(-0.88, uv.y) * step(uv.y, top);
+    float seg = smoothstep(0.06, 0.02, abs(fract(uv.y*14.0) - 0.5) - 0.40);
+    col = pal(bid/n + b*0.25) * inBar * (0.30 + b*1.1) * (0.55 + 0.45*seg);
+    float cap = smoothstep(0.015, 0.0, abs(uv.y - top - 0.05 - uPulse*0.03));
+    col += vec3(1.0) * cap * step(-0.88, uv.y) * 0.5;
+    float refl = step(uv.y, -0.90) * step(-1.0, uv.y) * step(uv.y + 1.76, top);
+    col += pal(bid/n) * refl * 0.12;
+    col += pal(0.1) * 0.04;
+  } else if (mode == 12) {    // ledwall
+    vec2 grid = vec2(P.x, P.y);
+    vec2 cell = floor(vec2(bx, vUv.y) * grid);
+    vec2 f = fract(vec2(bx, vUv.y) * grid) - 0.5;
+    float b = band(cell.x/grid.x);
+    float on = step(cell.y/grid.y, b*1.05);
+    float dot2 = smoothstep(0.42, 0.30, length(f));
+    float flick = 0.85 + 0.15*sin(t*7.0 + cell.x*3.1 + cell.y*1.7);
+    col = pal(cell.x/grid.x + cell.y/grid.y*0.2) * on * dot2 * flick * (0.35 + b*1.2);
+  } else if (mode == 13) {    // plasma metaballs
+    float field = 0.0;
+    for (int i = 0; i < 6; i++) {
+      float fi = float(i);
+      vec2 c = vec2(sin(t*(0.23+0.11*fi)*P.y + fi*2.4), cos(t*(0.19+0.09*fi)*P.y + fi*1.3)) * 0.45;
+      float rad = 0.16 + band(fi/6.0)*0.30;
+      field += rad / max(0.06, length(uv - c));
+    }
+    col = pal(field*0.16 + t*0.02) * smoothstep(0.9, 2.4, field) * (0.5 + 0.5*mid);
+    col += pal(field*0.16 + 0.5) * smoothstep(0.06, 0.0, abs(field - 1.6)) * 0.8;
+  } else if (mode == 14) {    // voronoi
+    vec2 g = uv * P.x;
+    vec2 ip = floor(g), fp = fract(g);
+    float f1 = 8.0, f2 = 8.0; vec2 id = vec2(0.0);
+    for (int j = -1; j <= 1; j++)
+    for (int i = -1; i <= 1; i++) {
+      vec2 o = vec2(float(i), float(j));
+      vec2 h = vec2(hash(ip+o), hash(ip+o+19.19));
+      vec2 p = o + h - fp;
+      float d = dot(p, p);
+      if (d < f1) { f2 = f1; f1 = d; id = ip+o; }
+      else if (d < f2) { f2 = d; }
+    }
+    float cb = band(fract(hash(id)*7.31));
+    float edge = 1.0 - smoothstep(0.0, 0.14, sqrt(f2) - sqrt(f1));
+    col = pal(cb + hash(id)*0.2) * (0.16 + cb*0.85);
+    col += pal(cb + 0.4) * edge * (0.6 + uPulse);
+  } else if (mode == 15) {    // moire
+    float g1 = sin(r*P.x*2.2 - t*1.6*P.y + lo*7.0);
+    float g2 = sin(length(uv - vec2(0.22*sin(t*0.4), 0.18*cos(t*0.31)))*P.x*2.0 + t*1.2*P.y);
+    float inter = g1*g2;
+    col = pal(inter*0.45 + 0.5 + sector*0.2) * (0.12 + 0.75*abs(inter)) * (0.5 + 0.6*mid);
+    col += pal(hi) * pow(abs(inter), 6.0) * 0.7;
+  } else if (mode == 16) {    // starfield
+    float streak = pow(0.5 + 0.5*sin(a*140.0 + r*36.0 - t*9.0*P.x), 10.0);
+    col = pal(sector + r*0.3) * streak * band(sector) * r * 1.3;
+    float stars = pow(vnoise(floor(vec2(a*57.0, r*90.0 - t*14.0*P.x))), 14.0);
+    col += vec3(1.0, 0.98, 0.92) * stars * (0.4 + hi) * smoothstep(0.05, 0.4, r);
+    col += pal(0.5) * (1.0 - smoothstep(0.0, 0.22, r)) * (0.25 + uPulse*0.7);
+  } else if (mode == 17) {    // spirograph
+    float pat = sin(a*P.x + r*P.y*2.4 - t*1.8*P.z) * sin(a*P.y - r*P.x*1.7 + t*1.2*P.z);
+    float line = pow(0.5 + 0.5*pat, 7.0);
+    col = pal(r*0.8 + pat*0.25 + t*0.02) * line * (0.55 + band(sector)*1.5) * (1.0 - smoothstep(0.6, 1.3, r));
+    col += pal(r*0.8) * abs(pat) * 0.06;
+  } else if (mode == 18) {    // gridwave
+    float horizon = 0.12;
+    if (uv.y > horizon) {
+      for (int k = 0; k < 3; k++) {
+        float fk = float(k);
+        float h = band(bx*(0.7+0.15*fk)) * (0.34 - fk*0.08);
+        float m = step(uv.y, horizon + h) * step(horizon + h - 0.012 - fk*0.004, uv.y);
+        col += pal(fk*0.28 + bx*0.25 + t*0.02) * m * (0.8 - fk*0.2);
+        col += pal(fk*0.28) * step(uv.y, horizon + h) * 0.05;
+      }
+      col += pal(0.85) * (0.5 + 0.5*sin(bx*40.0)) * hi * 0.1;
+    } else {
+      float persp = 0.14 / max(0.02, horizon - uv.y);
+      float gx = smoothstep(0.06, 0.0, abs(fract(uv.x*persp*1.4) - 0.5) - 0.42);
+      float gz = smoothstep(0.10, 0.0, abs(fract(persp*0.7 - t*P.x*0.8) - 0.5) - 0.40);
+      col = pal(0.55 + persp*0.05) * max(gx, gz) * (0.25 + 0.45*lo) * (1.0 - smoothstep(0.3, 1.0, horizon - uv.y));
+    }
+  } else if (mode == 19) {    // skyline
+    float n = P.w;
+    float bid = floor(bx*n);
+    float bh = hash(vec2(bid, 3.0))*0.55 + band(bid/n)*0.75;
+    float top = -1.0 + bh;
+    float inB = step(uv.y, top) * step(-1.0, uv.y);
+    vec2 win = fract(vec2(bx*n*4.0, uv.y*22.0));
+    float lit = step(0.72, hash(floor(vec2(bx*n*4.0, uv.y*22.0)) + floor(t*0.5))) * inB;
+    float winShape = step(0.25, win.x) * step(win.x, 0.75) * step(0.3, win.y) * step(win.y, 0.8);
+    col = pal(bid/n*0.5) * inB * 0.16;
+    col += pal(0.75 + hash(vec2(bid, 9.0))*0.2) * lit * winShape * 1.1;
+    float refl = step(-1.0, uv.y) * step(uv.y, -1.0 + bh*0.35) * (1.0 - step(uv.y, top));
+    col += pal(bid/n*0.5) * refl * 0.05;
+    col += pal(0.1) * 0.03;
+  } else if (mode == 20) {    // rings (beat pulses)
+    for (int k = 0; k < 4; k++) {
+      float fk = float(k);
+      float age = fract(t*P.x + fk*0.25);
+      float rad = age*1.35;
+      float bright = (1.0 - age) * (0.25 + band(fk/4.0 + age*0.25));
+      col += pal(age*0.7 + fk*0.22) * exp(-pow((r - rad)*26.0, 2.0)) * bright * 2.0;
+    }
+    col += pal(0.4) * (1.0 - smoothstep(0.0, 0.30, r)) * (0.15 + uPulse*0.9);
+  } else if (mode == 21) {    // helix
+    for (int s = 0; s < 2; s++) {
+      float fs = float(s);
+      float yc = sin(bx*3.14159*P.x + t*1.7*P.y + fs*3.14159) * 0.52;
+      float d = abs(uv.y - yc);
+      float thick = 0.5 + band(bx*(0.6+0.3*fs));
+      col += pal(fs*0.45 + bx*0.5 + t*0.03) * exp(-d*d*320.0) * thick * 1.2;
+    }
+    float rung = pow(0.5 + 0.5*sin(bx*3.14159*P.x + t*1.7*P.y), 24.0);
+    col += pal(0.6) * rung * exp(-pow(uv.y*1.4, 2.0)) * (0.3 + mid*0.7);
+  } else if (mode == 22) {    // iris
+    float fiber = vnoise(vec2(a*P.x*0.16, r*3.5 - t*0.25*P.y));
+    float zone = smoothstep(0.14, 0.20, r) * (1.0 - smoothstep(0.55, 0.95, r));
+    col = pal(r*0.9 + fiber*0.35) * zone * (0.25 + band(sector)*1.0) * (0.5 + fiber);
+    float pupil = 1.0 - smoothstep(0.13, 0.15, r);
+    if (uHasCover > 0.5) col = mix(col, coverAt(uv/0.14*0.5+0.5, 0.95), pupil);
+    else col += vec3(0.01) * pupil;
+    col += pal(0.9) * (1.0 - smoothstep(0.0, 0.03, abs(r - 0.62 - lo*0.1))) * 0.5;
+  } else if (mode == 23) {    // liquid
+    vec2 q = vec2(fbm(uv*P.x + t*0.10*P.y), fbm(uv*P.x + vec2(5.2, 1.3) - t*0.08*P.y));
+    float v = fbm(uv*P.x + q*1.6 + vec2(lo*1.5, mid));
+    col = pal(v + q.x*0.25 + t*0.015) * (0.30 + 0.45*mid + 0.35*q.y);
+    col += pal(v + 0.5) * smoothstep(0.05, 0.0, abs(v - 0.55)) * 0.35;
+  } else if (mode == 24) {    // glitch
+    float rows = max(4.0, floor(P.x));
+    float row = floor(vUv.y*rows);
+    float off = (hash(vec2(row, floor(t*9.0))) - 0.5) * (0.10 + hi*0.45);
+    float bxg = fract(bx + off);
+    float blk = floor(bxg*28.0)/28.0;
+    vec3 split = vec3(pal(fract(blk + off*0.7)).r, pal(blk).g, pal(fract(blk - off*0.7)).b);
+    float slice = 0.70 + 0.30*step(0.5, fract(vUv.y*rows));
+    float blockShade = 0.75 + 0.5*hash(vec2(floor(bxg*28.0), row));
+    col = split * (0.22 + band(blk)*1.3) * slice * blockShade;
+    col += vec3(1.0) * step(0.985, hash(vec2(row, floor(t*24.0)))) * hi * 0.8;
+    col += vec3(1.0) * step(0.93, hash(vec2(floor(bxg*28.0), floor(t*13.0)))) * hi * 0.35;
+  } else if (mode == 25) {    // halftone
+    vec2 g = vec2(bx, vUv.y) * vec2(P.x, P.x*1.9);
+    vec2 cell = floor(g);
+    vec2 f = fract(g) - 0.5;
+    float b = band(cell.x/P.x);
+    float rad = b * 0.46;
+    float dot2 = smoothstep(rad, rad*0.65, length(f));
+    col = pal(cell.x/P.x + cell.y/P.x*0.15) * dot2 * (0.4 + b*1.1);
+    col += pal(0.08) * 0.10;
+  } else if (mode == 26) {    // contour
+    float h = fbm(uv*1.8 + vec2(t*0.05*P.y, 0.0)) + lo*0.7*sin(uv.x*3.0 + t*0.4) + mid*0.4;
+    float c = abs(fract(h*P.x) - 0.5);
+    float line = smoothstep(0.10, 0.02, c);
+    col = pal(h*0.8 + t*0.01) * (0.10 + line*1.15) * (0.45 + 0.55*mid);
+    col += pal(h*0.8 + 0.5) * smoothstep(0.03, 0.0, c) * 0.5;
+  } else if (mode == 27) {    // fire
+    float rise = fbm(vec2(uv.x*3.2, uv.y*2.0 - t*(0.7 + P.x*0.5)));
+    float body = (1.05 - vUv.y) + (rise - 0.5)*1.1 + lo*0.35;
+    float flame = clamp(body * (1.0 - smoothstep(0.35, 0.95, vUv.y + (rise-0.5)*0.4)), 0.0, 1.2);
+    col = pal(clamp(flame, 0.0, 1.0)*0.85) * flame * (0.8 + P.x*0.8);
+    float sparks = pow(vnoise(vec2(uv.x*36.0, uv.y*36.0 - t*2.6)), 18.0);
+    col += pal(0.9) * sparks * hi * 2.0 * step(0.25, vUv.y);
+    col *= smoothstep(0.0, 0.06, vUv.y) * 0.9 + 0.1;
+  } else if (mode == 28) {    // rain
+    float n = max(10.0, floor(P.x));
+    float cid = floor(bx*n);
+    float speed = 0.4 + hash(vec2(cid, 1.0))*0.9;
+    float drop = fract(vUv.y + t*P.y*speed + hash(vec2(cid, 7.0))*7.0);
+    float dash = smoothstep(0.0, 0.10, drop) * smoothstep(0.5, 0.32, drop);
+    float glyph = step(0.4, fract(vUv.y*36.0 + cid));
+    float b = band(cid/n);
+    col = pal(cid/n + drop*0.25) * dash * glyph * (0.25 + b*1.3);
+    col += pal(cid/n) * dash * 0.15;
+  } else if (mode == 29) {    // bubbles
+    vec2 g = uv * P.x * 0.5;
+    vec2 ip = floor(g);
+    col = pal(uv.y*0.3 + 0.4) * (0.05 + 0.10*lo);
+    for (int j = -1; j <= 1; j++)
+    for (int i = -1; i <= 1; i++) {
+      vec2 o = vec2(float(i), float(j));
+      vec2 cellId = ip + o;
+      float h1 = hash(cellId);
+      vec2 center = o + vec2(h1, fract(h1*7.0 + t*(0.05 + h1*0.10)*P.y)) - fract(g);
+      float d = length(center);
+      float ringB = smoothstep(0.46, 0.42, d) * smoothstep(0.30, 0.42, d);
+      float hl = smoothstep(0.10, 0.0, length(center - vec2(-0.12, 0.14)));
+      col += pal(h1) * (ringB*0.7 + hl*0.9) * (0.35 + band(fract(h1*3.7)));
+    }
+  } else if (mode == 30) {    // laserfan
+    vec2 org = vec2(0.0, -1.05);
+    vec2 dv = uv - org;
+    float la = atan(dv.x, dv.y);
+    float dist = length(dv);
+    float beams = pow(0.5 + 0.5*sin(la*P.x + sin(t*0.9)*1.6), 28.0);
+    float sweep = pow(0.5 + 0.5*sin(la*3.0 - t*P.y*1.4), 6.0);
+    float b = band(clamp(abs(la)*0.45, 0.0, 1.0));
+    col = pal(la*0.35 + t*0.04) * (beams*1.6 + sweep*0.5) * (0.25 + b*1.2) * exp(-dist*0.75);
+    col += pal(0.5) * exp(-dist*dist*22.0) * (0.6 + uPulse);
+  } else {                    // gears (31)
+    col = pal(0.12) * 0.05;
+    for (int k = 0; k < 2; k++) {
+      float fk = float(k);
+      vec2 c = fk < 0.5 ? vec2(0.0, 0.05) : vec2(0.34, 0.52);
+      float rad0 = fk < 0.5 ? 0.52 : 0.26;
+      vec2 dv = uv - c;
+      float d = length(dv);
+      float aa = atan(dv.y, dv.x);
+      float dirn = fk < 0.5 ? 1.0 : -1.65;
+      float tooth = sin(aa*P.x*(fk < 0.5 ? 2.0 : 3.0) + dirn*t*P.y);
+      float rr = rad0 + tooth*(fk < 0.5 ? 0.045 : 0.035) + band(fk*0.4)*0.02;
+      float ringM = smoothstep(0.035, 0.008, abs(d - rr));
+      float hub = smoothstep(0.02, 0.0, abs(d - rad0*0.35));
+      float spokes = pow(0.5 + 0.5*sin(aa*6.0 + dirn*t*P.y), 3.0) * smoothstep(rad0*0.9, rad0*0.3, d) * step(rad0*0.3, d);
+      float fill = step(d, rr) * 0.13;
+      col += pal(fk*0.4 + band(sector)*0.3) * (ringM*1.9 + hub*1.2 + spokes*0.7 + fill) * (0.5 + mid);
+    }
+  }
+  return col;
+}
+
+void main(){
+  vec2 uv = vUv*2.0-1.0;
+  uv.x *= uRes.x/uRes.y;
+  float r = length(uv);
+  float a = atan(uv.y, uv.x);
+  vec3 col = shade(uMode, uParams, uv, r, a);
+  if (uBlend > 0.001) {
+    vec3 next = shade(uModeNext, uParamsNext, uv, r, a);
+    col = mix(col, next, uBlend);
   }
   col *= uGlow;
   col += uPulse * 0.08 * vec3(0.4,0.8,1.0);
@@ -202,35 +526,54 @@ const loc = gl.getAttribLocation(prog, "p");
 gl.enableVertexAttribArray(loc);
 gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 const U = {};
-for (const name of ["uTime","uRMS","uPulse","uSpin","uGlow","uHasCover","uMode","uRes","uSpec","uPal","uCover"]) {
+for (const name of ["uTime","uRMS","uPulse","uGlow","uHasCover","uBlend","uFrame","uHistH",
+                    "uMode","uModeNext","uParams","uParamsNext","uRes",
+                    "uSpec","uPal","uCover","uHist"]) {
   U[name] = gl.getUniformLocation(prog, name);
 }
-function makeTexture(unit, width, height, data, image) {
+function makeTexture(unit, width, height, data, image, nearest) {
   const tex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit);
   gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const filter = nearest ? gl.NEAREST : gl.LINEAR;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   if (image) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
   else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
   return tex;
 }
-const specTex = makeTexture(0, 64, 1, new Uint8Array(64 * 4).fill(0), null);
-let palTex = makeTexture(1, 32, 1, defaultPalette(), null);
+const specTex = makeTexture(0, 64, 1, new Uint8Array(64 * 4), null, true);
+let palTex = makeTexture(1, 32, 1, defaultPalette(), null, false);
 let coverTex = null;
+let histTex = makeTexture(3, 64, 1, new Uint8Array(64 * 4), null, true);
+let histH = 1;
 const specBytes = new Uint8Array(64 * 4);
 
 function applyThemeTextures(coverImg) {
   if (theme.palette) {
     gl.deleteTexture(palTex);
-    palTex = makeTexture(1, 32, 1, paletteTexture(theme.palette), null);
+    palTex = makeTexture(1, 32, 1, paletteTexture(theme.palette), null, false);
   }
-  if (coverImg) coverTex = makeTexture(2, 0, 0, null, coverImg);
+  if (coverImg) coverTex = makeTexture(2, 0, 0, null, coverImg, false);
+}
+function uploadHistory(spectrum) {
+  const n = spectrum.length;
+  const data = new Uint8Array(64 * n * 4);
+  for (let f = 0; f < n; f++) {
+    for (let b = 0; b < 64; b++) {
+      const v = Math.max(0, Math.min(255, Math.round((spectrum[f][b] || 0) * 255)));
+      const o = (f * 64 + b) * 4;
+      data[o] = v; data[o+1] = v; data[o+2] = v; data[o+3] = 255;
+    }
+  }
+  gl.deleteTexture(histTex);
+  histTex = makeTexture(3, 64, n, data, null, true);
+  histH = n;
 }
 
-function drawFrame(spectrum, rms, pulse, time) {
+function drawFrame(spectrum, rms, pulse, time, frameIdx) {
   for (let i = 0; i < 64; i++) {
     const v = Math.max(0, Math.min(255, Math.round((spectrum[i] || 0) * 255)));
     specBytes[i*4] = v; specBytes[i*4+1] = v; specBytes[i*4+2] = v; specBytes[i*4+3] = 255;
@@ -238,17 +581,24 @@ function drawFrame(spectrum, rms, pulse, time) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, specTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, specBytes);
+  const at = scheduleAt(time);
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.uniform1i(U.uSpec, 0);
   gl.uniform1i(U.uPal, 1);
   gl.uniform1i(U.uCover, 2);
+  gl.uniform1i(U.uHist, 3);
   gl.uniform1f(U.uTime, time);
   gl.uniform1f(U.uRMS, rms);
   gl.uniform1f(U.uPulse, pulse);
-  gl.uniform1f(U.uSpin, theme.spin);
   gl.uniform1f(U.uGlow, theme.glow);
   gl.uniform1f(U.uHasCover, coverTex ? 1 : 0);
-  gl.uniform1i(U.uMode, theme.mode);
+  gl.uniform1f(U.uBlend, at.nxt ? at.blend : 0);
+  gl.uniform1f(U.uFrame, frameIdx || 0);
+  gl.uniform1f(U.uHistH, histH);
+  gl.uniform1i(U.uMode, at.cur.mode);
+  gl.uniform1i(U.uModeNext, at.nxt ? at.nxt.mode : at.cur.mode);
+  gl.uniform4fv(U.uParams, at.cur.params || [1, 0.5, 0.3, 0]);
+  gl.uniform4fv(U.uParamsNext, (at.nxt && at.nxt.params) || at.cur.params || [1, 0.5, 0.3, 0]);
   gl.uniform2f(U.uRes, canvas.width, canvas.height);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
@@ -274,7 +624,7 @@ window.__drawFrame = function(i) {
   if (!frames) return;
   const idx = Math.max(0, Math.min(frames.spectrum.length - 1, i));
   const t = idx / frames.fps;
-  drawFrame(frames.spectrum[idx], frames.rms[idx] || 0, frames.pulse[idx] || 0, t);
+  drawFrame(frames.spectrum[idx], frames.rms[idx] || 0, frames.pulse[idx] || 0, t, idx);
   showCaption(t);
 };
 
@@ -320,6 +670,7 @@ async function initRender() {
   applyThemeTextures(coverImg);
   const resp = await fetch(dataUrl);
   frames = await resp.json();
+  uploadHistory(frames.spectrum);
   if (SHOW_CAPTIONS && params.get("capdata")) {
     const cr = await fetch(params.get("capdata"));
     captionCues = await cr.json();
@@ -357,7 +708,7 @@ function liveLoop(tms) {
   for (let i = 0; i < 8; i++) rms += bands[i];
   rms /= 8;
   const pulse = Math.max(0, rms - 0.45) * 1.6;
-  drawFrame(bands, Math.min(1, rms * 1.6), Math.min(1, pulse), t);
+  drawFrame(bands, Math.min(1, rms * 1.6), Math.min(1, pulse), t, Math.floor(t * 30));
   if (audioEl) showCaption(audioEl.currentTime);
   requestAnimationFrame(liveLoop);
 }
