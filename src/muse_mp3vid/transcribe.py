@@ -7,6 +7,7 @@ faster-whisper's file path before.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -67,19 +68,30 @@ def cached_model_path(model_size: str) -> str | None:
         return None
 
 
+def _cpu_threads(device: str) -> int:
+    """CTranslate2 defaults to 4 CPU threads whatever the machine has;
+    use every logical core on CPU. 0 = library default (used for GPU)."""
+    return (os.cpu_count() or 4) if device == "cpu" else 0
+
+
+@functools.lru_cache(maxsize=2)
 def _load_model(model_size: str, device: str, compute_type: str):
-    """Cache-first WhisperModel load with retries on connection resets."""
+    """Cache-first WhisperModel load with retries on connection resets.
+    Memoized so the full-song pass and the hook-window pass share one load."""
     import time
 
     from faster_whisper import WhisperModel
 
+    threads = _cpu_threads(device)
     cached = cached_model_path(model_size)
     if cached:
-        return WhisperModel(cached, device=device, compute_type=compute_type)
+        return WhisperModel(cached, device=device, compute_type=compute_type,
+                            cpu_threads=threads)
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            return WhisperModel(model_size, device=device, compute_type=compute_type)
+            return WhisperModel(model_size, device=device, compute_type=compute_type,
+                                cpu_threads=threads)
         except Exception as exc:  # noqa: BLE001 - re-raised with guidance below
             last_exc = exc
             if not any(m in str(exc) or m in type(exc).__name__ for m in _CONN_MARKERS):
@@ -95,9 +107,13 @@ def _load_model(model_size: str, device: str, compute_type: str):
     )
 
 
-def _decode_for_whisper(audio_path: str | Path) -> np.ndarray:
+def _decode_for_whisper(audio_path: str | Path, start: float = 0.0,
+                        end: float | None = None) -> np.ndarray:
+    span = ["-ss", f"{start:.3f}"] if start > 0 else []
+    if end is not None:
+        span += ["-t", f"{max(0.0, end - start):.3f}"]
     cmd = [
-        "ffmpeg", "-v", "error", "-i", str(audio_path),
+        "ffmpeg", "-v", "error", *span, "-i", str(audio_path),
         "-f", "f32le", "-ac", "1", "-ar", str(WHISPER_SR), "-",
     ]
     proc = subprocess.run(cmd, capture_output=True)
@@ -116,13 +132,20 @@ def segment_coverage(segments: list[dict], duration: float) -> float:
     return min(1.0, covered / duration)
 
 
-def _transcribe_once(model, samples, language, beam_size, vad_filter):
+def _transcribe_once(model, samples, language, beam_size, vad_filter,
+                     word_timestamps=True, fallback=True):
+    kw = {}
+    if not fallback:
+        # Default temperature ladder re-decodes any low-confidence segment up
+        # to 5 more times (best_of=5); sung vocals trip it constantly.
+        kw["temperature"] = 0.0
     segments_iter, info = model.transcribe(
         samples,
         language=language,
         beam_size=beam_size,
-        word_timestamps=True,
+        word_timestamps=word_timestamps,
         vad_filter=vad_filter,
+        **kw,
     )
     segments = []
     for seg in segments_iter:
@@ -154,6 +177,8 @@ def transcribe_audio(
     compute_type: str = "int8",
     language: str | None = None,
     beam_size: int = 5,
+    word_timestamps: bool = True,
+    fallback: bool = True,
 ) -> dict:
     """Transcribe an audio file. Returns a JSON-serializable dict:
 
@@ -171,14 +196,16 @@ def transcribe_audio(
     """
     model = _load_model(model_size, device, compute_type)
     samples = _decode_for_whisper(audio_path)
-    segments, info = _transcribe_once(model, samples, language, beam_size, True)
+    segments, info = _transcribe_once(model, samples, language, beam_size, True,
+                                      word_timestamps, fallback)
     duration = float(info.duration)
     coverage = segment_coverage(segments, duration)
     vad_fallback = False
     if duration >= 20.0 and coverage < 0.25:
         print(f"  [transcribe] VAD pass covered only {coverage:.0%} of the song; "
               "retrying without VAD (VAD strips sung vocals)...")
-        segments2, info2 = _transcribe_once(model, samples, language, beam_size, False)
+        segments2, info2 = _transcribe_once(model, samples, language, beam_size, False,
+                                            word_timestamps, fallback)
         coverage2 = segment_coverage(segments2, float(info2.duration))
         if coverage2 > coverage:
             segments, info, coverage = segments2, info2, coverage2
@@ -193,6 +220,72 @@ def transcribe_audio(
         "vad_fallback": vad_fallback,
         "segments": segments,
     }
+
+
+def window_needs_words(transcript: dict, start: float, end: float) -> bool:
+    """True if [start, end] has no word timings yet. Windowed transcripts
+    (hook-only mode) record which windows were transcribed; legacy
+    whole-song transcripts are checked segment by segment."""
+    if transcript.get("windowed"):
+        return not any(a <= start + 1e-6 and end <= b + 1e-6
+                       for a, b in transcript.get("refined_windows", []))
+    return any(
+        not s.get("words")
+        for s in transcript.get("segments", [])
+        if s["end"] > start and s["start"] < end
+    )
+
+
+def refine_window(
+    audio_path: str | Path,
+    transcript: dict,
+    start: float,
+    end: float,
+    model_size: str = "small",
+    device: str = "cpu",
+    compute_type: str = "int8",
+    beam_size: int = 5,
+    pad: float = 1.0,
+    language: str | None = None,
+) -> dict:
+    """Re-transcribe only the hook window with word timestamps and beam
+    search, then splice it over the coarse segments it replaces. Captions
+    need word timings for ~30 s, not for the whole song. Returns a new
+    transcript dict; the input is not mutated."""
+    lo = max(0.0, start - pad)
+    hi = end + pad
+    model = _load_model(model_size, device, compute_type)
+    samples = _decode_for_whisper(audio_path, lo, hi)
+    lang = transcript.get("language") or language
+    vad = not transcript.get("vad_fallback", False)
+    segs, info = _transcribe_once(model, samples, lang, beam_size, vad,
+                                  word_timestamps=True, fallback=True)
+    span = hi - lo
+    if vad and span >= 20.0 and segment_coverage(segs, span) < 0.25:
+        # VAD can strip sung vocals entirely; keep whichever pass heard more
+        segs2, info2 = _transcribe_once(model, samples, lang, beam_size, False,
+                                        word_timestamps=True, fallback=True)
+        if segment_coverage(segs2, span) > segment_coverage(segs, span):
+            segs, info, vad = segs2, info2, False
+    for s in segs:  # window-relative -> song-absolute
+        s["start"] = round(s["start"] + lo, 3)
+        s["end"] = round(s["end"] + lo, 3)
+        for w in s["words"]:
+            w["start"] = round(w["start"] + lo, 3)
+            w["end"] = round(w["end"] + lo, 3)
+    kept = [s for s in transcript["segments"] if s["end"] <= lo or s["start"] >= hi]
+    merged = sorted(kept + segs, key=lambda s: s["start"])
+    for i, s in enumerate(merged):
+        s["id"] = i
+    out = dict(transcript)
+    out["segments"] = merged
+    out["refined_window"] = [round(lo, 3), round(hi, 3)]
+    out["refined_windows"] = list(transcript.get("refined_windows", [])) + [[round(lo, 3), round(hi, 3)]]
+    out["vad_fallback"] = not vad
+    if not out.get("language"):
+        out["language"] = info.language
+        out["language_probability"] = round(info.language_probability, 4)
+    return out
 
 
 def save_transcript(transcript: dict, path: str | Path) -> None:

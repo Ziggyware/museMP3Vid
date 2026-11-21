@@ -265,7 +265,7 @@ def section_boundaries(
     rms: list[dict],
     hook_start: float,
     hook_end: float,
-    min_len: float = 3.5,
+    min_len: float = 10.0,
     max_sections: int = 5,
 ) -> list[float]:
     """Section start times relative to the hook start, always beginning at 0.

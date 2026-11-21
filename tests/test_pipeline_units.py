@@ -226,5 +226,39 @@ class FeatureTests(unittest.TestCase):
         self.assertAlmostEqual(series[0]["rms"], 0.5, places=3)
 
 
+class MinWindowTests(unittest.TestCase):
+    """The 10s floor: no exported video may be shorter than
+    hook.MIN_VIDEO_SECONDS, whatever path chose the window."""
+
+    def test_long_window_untouched(self):
+        chosen = {"start": 20.0, "end": 50.0, "score": 0.9, "reasons": {}}
+        self.assertIs(hook.enforce_min_window(chosen, 70.0), chosen)
+
+    def test_short_window_extended_forward(self):
+        out = hook.enforce_min_window({"start": 10.5, "end": 16.5, "reasons": {}}, 70.0)
+        self.assertEqual((out["start"], out["end"]), (10.5, 20.5))
+        self.assertIn("min_length", out["reasons"])
+
+    def test_tail_window_shifted_back(self):
+        out = hook.enforce_min_window({"start": 65.0, "end": 70.0, "reasons": {}}, 70.0)
+        self.assertEqual((out["start"], out["end"]), (60.0, 70.0))
+
+    def test_start_past_the_song_is_pulled_back(self):
+        out = hook.enforce_min_window({"start": 999.0, "end": 70.0, "reasons": {}}, 70.0)
+        self.assertEqual((out["start"], out["end"]), (60.0, 70.0))
+
+    def test_song_shorter_than_minimum_refused(self):
+        self.assertIsNone(hook.enforce_min_window({"start": 0.0, "end": 8.0}, 8.0))
+
+    def test_detect_hooks_small_hook_len_still_finds_candidates(self):
+        # regression: detect_hooks used to discard EVERY candidate when
+        # hook_len < 10, so the CLI died with "no hook candidates"
+        tr, rms = _chorus_song()
+        cands = hook.detect_hooks(tr, rms, hook_len=6.0, top_n=3)
+        self.assertTrue(cands)
+        for c in cands:
+            self.assertAlmostEqual(c["end"] - c["start"], 6.0, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()

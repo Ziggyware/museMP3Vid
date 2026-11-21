@@ -46,9 +46,13 @@ def _run(cmd: list[str], cwd: str | None = None) -> None:
 
 def extract_hook_audio(song: str, start: float, end: float, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Output-side seek (after -i): sample-accurate. Input-side -ss on an
+    # MP3 lands on a frame boundary up to ~26 ms before the requested start
+    # and AAC priming pads the tail, so the hook audio drifted long and
+    # started early; the export then inherited the wrong length.
     _run([
         "ffmpeg", "-y", "-v", "error",
-        "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-i", song,
+        "-i", song, "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
         "-vn", "-c:a", "aac", "-b:a", "192k", str(out_path),
     ])
     return out_path
@@ -326,21 +330,37 @@ def fallback_visual(hook_audio: Path, duration: float, out_path: Path) -> Path:
     return out_path
 
 
-def compose(visual: Path, hook_audio: Path, ass_path: Path | None, out_path: Path) -> Path:
-    """Burn captions (ASS) over the visual and mux the hook audio."""
+def compose(visual: Path, hook_audio: Path, ass_path: Path | None, out_path: Path,
+            duration: float | None = None) -> Path:
+    """Burn captions (ASS) over the visual and mux the hook audio.
+
+    When `duration` (the hook window length) is known, the output is
+    capped at exactly that length with -t. -shortest alone trusts the
+    streams' own durations, which is how MP3 seek slop, AAC priming and
+    duration-less MediaRecorder WebMs used to stretch the exported
+    short past the hook it was supposed to be."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # The ass filter needs a bare filename + cwd; resolve the media paths
+    # to absolute first so the cwd switch cannot break them.
+    visual = Path(visual).resolve()
+    hook_audio = Path(hook_audio).resolve()
+    out_path = Path(out_path).resolve()
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(visual), "-i", str(hook_audio)]
     cwd = None
     if ass_path is not None and ass_path.exists():
         cmd += ["-vf", f"ass={ass_path.name}"]
-        cwd = str(ass_path.parent)
+        cwd = str(Path(ass_path).resolve().parent)
     cmd += [
         "-map", "0:v", "-map", "1:a",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
         "-pix_fmt", "yuv420p", "-r", "30",
         "-c:a", "aac", "-b:a", "192k",
-        "-shortest", "-movflags", "+faststart", str(out_path),
     ]
+    if duration is not None and duration > 0:
+        cmd += ["-t", f"{duration:.3f}"]
+    else:
+        cmd += ["-shortest"]
+    cmd += ["-movflags", "+faststart", str(out_path)]
     _run(cmd, cwd=cwd)
     return out_path
 
@@ -373,7 +393,7 @@ def export_shorts(
         platform_ass = job_dir / f"captions_{platform}.ass"
         ass_path = platform_ass if platform_ass.exists() else job_dir / "captions.ass"
         out_path = out_dir / f"{song_stem}_hook_{preset['suffix']}.mp4"
-        compose(visual, hook_audio, ass_path, out_path)
+        compose(visual, hook_audio, ass_path, out_path, duration=duration)
         post = out_dir / f"{song_stem}_hook_{preset['suffix']}.post.txt"
         post.write_text(
             f"{song_stem} - the hook\n#music #newmusic #hook #shorts\n",

@@ -19,6 +19,38 @@ import re
 
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 
+# No exported video may be shorter than this. The CLI enforces it on the
+# chosen hook window (see enforce_min_window) and verifies it on the
+# rendered files, so a short can never slip out under this length.
+MIN_VIDEO_SECONDS = 10.0
+
+
+def enforce_min_window(chosen: dict, duration: float,
+                       min_seconds: float = MIN_VIDEO_SECONDS) -> dict | None:
+    """Return `chosen` guaranteed to span at least `min_seconds`, or None
+    when the song itself is shorter than the minimum (no honest window
+    exists). A short window is extended forward first - the start is the
+    detector's best guess and worth keeping - and shifted back only when
+    it runs into the end of the song. An already-long-enough window is
+    returned unchanged (the same object)."""
+    if duration < min_seconds:
+        return None
+    start = min(max(0.0, float(chosen["start"])), duration - min_seconds)
+    end = float(chosen["end"])
+    if end - start < min_seconds - 1e-6:
+        end = min(duration, start + min_seconds)
+    if end - start < min_seconds - 1e-6:
+        start = end - min_seconds
+    if start == float(chosen["start"]) and end == float(chosen["end"]):
+        return chosen
+    out = dict(chosen)
+    out["start"] = round(start, 3)
+    out["end"] = round(end, 3)
+    reasons = dict(chosen.get("reasons") or {})
+    reasons["min_length"] = f"window adjusted to the {min_seconds:.0f}s minimum video length"
+    out["reasons"] = reasons
+    return out
+
 
 def _tokens(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
@@ -112,8 +144,14 @@ def detect_hooks(
     candidates: list[dict] = []
     for start in sorted(starts):
         end = min(duration, start + hook_len)
-        if end - start < min(5.0, hook_len):
+        # Full-length windows only: a start too close to the end of
+        # the song would truncate the window. (The minimum video
+        # length itself is enforced later, on the chosen window -
+        # see enforce_min_window.)
+        if end - start < min(hook_len, duration) - 1e-6:
             continue
+
+            
         r = _window_repetition(segments, rep, start, end)
         e = _window_energy(rms, start, end, peak_rms)
         c = _window_coverage(segments, start, end)
@@ -132,3 +170,77 @@ def detect_hooks(
         )
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates[:top_n]
+
+
+def detect_hooks_audio(
+    features,
+    rms: list[dict],
+    duration: float,
+    fps: int = 2,
+    hook_len: float = 30.0,
+    top_n: int = 3,
+) -> list[dict]:
+    """Hook candidates from audio alone (no transcript): a window scores high
+    when its feature sequence recurs elsewhere in the song (self-similarity
+    along diagonals of the frame-by-frame cosine matrix) and is loud.
+
+        score = 0.6 * repetition + 0.4 * energy
+
+    Every candidate is exactly `hook_len` long (or the whole song if shorter).
+    `features`: [frames, dims] at `fps` frames/second."""
+    import numpy as np
+
+    n = len(features)
+    if duration <= 0 or n == 0:
+        return []
+    hook_len = min(hook_len, duration)
+    w = max(1, int(round(hook_len * fps)))
+    if n < w:
+        return [{"start": 0.0, "end": round(duration, 3), "score": 0.0,
+                 "reasons": {"repetition": 0.0, "energy": 0.0}}]
+
+    X = np.asarray(features, dtype=np.float64)
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-6)
+    X /= np.linalg.norm(X, axis=1, keepdims=True) + 1e-9
+    S = X @ X.T
+    rep = np.zeros(n - w + 1)
+    for lag in range(w, n - w + 1):          # partner window must not overlap
+        d = np.diagonal(S, offset=lag)
+        cs = np.concatenate([[0.0], np.cumsum(d)])
+        m = (cs[w:] - cs[:-w]) / w           # mean similarity, window start j
+        rep[: len(m)] = np.maximum(rep[: len(m)], m)
+        rep[lag: lag + len(m)] = np.maximum(rep[lag: lag + len(m)], m)
+    rep = np.clip(rep, 0.0, 1.0)
+
+    peak = max((p["rms"] for p in rms), default=0.0)
+    cands = []
+    for i in range(len(rep)):
+        start = i / fps
+        end = start + hook_len
+        e = _window_energy(rms, start, end, peak)
+        cands.append({
+            "start": round(start, 3), "end": round(min(end, duration), 3),
+            "score": round(float(0.6 * rep[i] + 0.4 * e), 4),
+            "reasons": {"repetition": round(float(rep[i]), 4), "energy": round(float(e), 4)},
+        })
+    cands.sort(key=lambda c: c["score"], reverse=True)
+    picked: list[dict] = []
+    for c in cands:                           # greedy, keep candidates apart
+        if all(abs(c["start"] - p["start"]) >= hook_len / 2 for p in picked):
+            picked.append(c)
+        if len(picked) >= top_n:
+            break
+    return picked
+
+
+def snap_start(segments: list[dict], start: float, hook_len: float,
+               duration: float, max_shift: float = 2.5) -> float:
+    """Move `start` to the nearest sung-line start within +-max_shift so the
+    short does not begin mid-word. Unchanged if no segment starts nearby."""
+    best = None
+    for s in segments:
+        t = float(s["start"])
+        if abs(t - start) <= max_shift and t + min(hook_len, duration) <= duration + 1e-6:
+            if best is None or abs(t - start) < abs(best - start):
+                best = t
+    return round(best, 3) if best is not None else start

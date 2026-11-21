@@ -12,10 +12,14 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 
+import numpy as np
+
 from . import analyze, captions as captions_mod, hook as hook_mod, render as render_mod, theme as theme_mod
-from .transcribe import flatten_words, load_transcript, save_transcript, transcribe_audio
+from .transcribe import (flatten_words, load_transcript, refine_window, save_transcript,
+                         transcribe_audio, window_needs_words)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,29 +37,21 @@ def run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = song.stem.replace(" ", "_")
 
-    # ---- Stage 1: Whisper transcription
-    transcript_path = out_dir / "transcript.json"
-    if args.skip_transcribe and transcript_path.exists():
-        transcript = load_transcript(transcript_path)
-        _log("transcribe", f"reused {transcript_path}")
-    else:
-        _log("transcribe", f"Whisper '{args.model}' on {song.name} ...")
-        transcript = transcribe_audio(
-            song,
-            model_size=args.model,
-            language=args.language,
-            device=args.device,
-            compute_type=args.compute_type,
-        )
-        save_transcript(transcript, transcript_path)
-    duration = transcript["duration"] or analyze.probe_duration(str(song))
-    _log("transcribe", f"language={transcript['language']} duration={duration:.1f}s "
-                        f"segments={len(transcript['segments'])}")
+    lap = time.perf_counter()
+    t_start = lap
 
-    # ---- Stage 2: audio analysis (energy for hook scoring)
+    def _lap(label: str) -> None:
+        nonlocal lap
+        now = time.perf_counter()
+        _log("time", f"{label}: {now - lap:.1f}s")
+        lap = now
+
+    # ---- Stage 1: decode + RMS energy (cheap; everything else needs it)
     _log("analyze", "decoding + RMS energy ...")
     samples = analyze.decode_audio(str(song))
     rms = analyze.rms_series(samples)
+    song_duration = len(samples) / analyze.SAMPLE_RATE
+    _lap("decode + rms")
 
     platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
     bad = [p for p in platforms if p not in render_mod.PLATFORM_PRESETS]
@@ -63,13 +59,43 @@ def run(args: argparse.Namespace) -> int:
         print(f"unknown platforms: {bad}", file=sys.stderr)
         return 2
 
-    # ---- Stage 2b: inputs for the visual theme (built after the hook is
-    # chosen, since the effect schedule follows the hook's sections)
-    coverage = 0.0
-    if duration > 0:
-        covered = sum(max(0.0, min(s["end"], duration) - s["start"])
-                      for s in transcript["segments"])
-        coverage = min(1.0, covered / duration)
+    # ---- Stage 2: transcription. Default is hook-only: Whisper never sees
+    # the rest of the song. --full-transcribe restores whole-song
+    # transcription + lyric-repetition hook scoring.
+    transcript_path = out_dir / "transcript.json"
+    if args.skip_transcribe and transcript_path.exists():
+        transcript = load_transcript(transcript_path)
+        _log("transcribe", f"reused {transcript_path}")
+    elif args.full_transcribe:
+        _log("transcribe", f"Whisper '{args.model}' on {song.name} (whole song) ...")
+        transcript = transcribe_audio(
+            song,
+            model_size=args.model,
+            language=args.language,
+            device=args.device,
+            compute_type=args.compute_type,
+            beam_size=5 if args.thorough else args.beam,
+            word_timestamps=args.thorough,
+            fallback=args.thorough,
+        )
+        save_transcript(transcript, transcript_path)
+    else:
+        transcript = {
+            "language": args.language, "language_probability": None,
+            "duration": round(song_duration, 3), "model": args.model,
+            "vad_fallback": False, "windowed": True, "refined_windows": [],
+            "segments": [],
+        }
+        _log("transcribe", "hook-only mode: Whisper runs on the chosen hook, not the song")
+    # The decoded PCM length is the authority on how long the song is. A
+    # transcript's duration comes from container/Whisper metadata and can
+    # disagree (MP3 padding estimates, a stale reused transcript); windows
+    # clamped to it could run past the real audio and come out short.
+    duration = song_duration
+    transcript["duration"] = round(song_duration, 3)
+    _lap("transcribe (whole song)")
+
+    # ---- Stage 2b: inputs for the visual theme
     if args.no_cover:
         cover_path = None
     elif args.cover:
@@ -79,7 +105,9 @@ def run(args: argparse.Namespace) -> int:
     coarse = analyze.frame_features(samples, fps=2)
 
     # ---- Stage 3: best-hook detection
-    if args.hook_start is not None:
+    use_lyrics = bool(transcript["segments"]) and not transcript.get("windowed")
+    source = "manual" if args.hook_start is not None else ("lyrics" if use_lyrics else "audio")
+    if source == "manual":
         start = max(0.0, args.hook_start)
         chosen = {
             "start": round(start, 3),
@@ -89,18 +117,77 @@ def run(args: argparse.Namespace) -> int:
         }
         candidates = [chosen]
     else:
-        candidates = hook_mod.detect_hooks(transcript, rms, hook_len=args.hook_len, top_n=3)
+        if source == "lyrics":
+            candidates = hook_mod.detect_hooks(transcript, rms, hook_len=args.hook_len, top_n=3)
+        else:
+            chroma = analyze.chroma_features(samples, fps=2)
+            spec = np.asarray(coarse["spectrum"], dtype=np.float32)
+            m = min(len(chroma), len(spec))
+            feats = np.hstack([chroma[:m] * 2.3, spec[:m]])  # balance 12 vs 64 dims
+            candidates = hook_mod.detect_hooks_audio(
+                feats, rms, duration, fps=2, hook_len=args.hook_len, top_n=3)
         if not candidates:
             print("no hook candidates (empty audio?)", file=sys.stderr)
             return 1
         chosen = candidates[0]
+    # ---- Minimum video length: no exported short may be under
+    # MIN_VIDEO_SECONDS. Short windows (a small --hook-len, a --hook-start
+    # near the end of the song) are extended/shifted to the minimum here,
+    # before anything transcribes or renders the window. A song shorter
+    # than the minimum cannot produce a video at all.
+    enforced = hook_mod.enforce_min_window(chosen, duration)
+    if enforced is None:
+        if not args.no_render:
+            print(f"song is {duration:.1f}s - shorter than the "
+                  f"{hook_mod.MIN_VIDEO_SECONDS:.0f}s minimum video length; "
+                  "no video created", file=sys.stderr)
+            return 1
+        _log("hook", f"WARNING: song ({duration:.1f}s) is shorter than the "
+                     f"{hook_mod.MIN_VIDEO_SECONDS:.0f}s minimum; artifacts only")
+    elif enforced is not chosen:
+        _log("hook", f"window {chosen['start']:.1f}s-{chosen['end']:.1f}s adjusted to "
+                     f"{enforced['start']:.1f}s-{enforced['end']:.1f}s "
+                     f"({hook_mod.MIN_VIDEO_SECONDS:.0f}s minimum)")
+        chosen = enforced
+        candidates[0] = chosen
+    _lap("hook detection")
+
+    # ---- Stage 3a: word timings for the hook window only
+    if window_needs_words(transcript, chosen["start"], chosen["end"]):
+        _log("transcribe", f"Whisper on hook {chosen['start']:.1f}s-{chosen['end']:.1f}s ...")
+        transcript = refine_window(song, transcript, chosen["start"], chosen["end"],
+                                   model_size=args.model, device=args.device,
+                                   compute_type=args.compute_type, language=args.language,
+                                   pad=3.0 if source == "audio" else 1.0)
+        save_transcript(transcript, transcript_path)
+        _lap("transcribe (hook window)")
+    if source == "audio":
+        # audio-detected starts land on a 0.5 s grid: pull to a sung-line start
+        # (the fit check uses the enforced window length, not the raw
+        # --hook-len, so snapping can never re-truncate the window)
+        win_len = chosen["end"] - chosen["start"]
+        s2 = hook_mod.snap_start(transcript["segments"], chosen["start"],
+                                 win_len, duration)
+        if s2 != chosen["start"]:
+            chosen = {**chosen, "start": s2,
+                      "end": round(min(duration, s2 + win_len), 3),
+                      "reasons": {**chosen["reasons"], "snapped_from": chosen["start"]}}
+            candidates[0] = chosen
     (out_dir / "hook.json").write_text(
-        json.dumps({"chosen": chosen, "candidates": candidates}, indent=2), encoding="utf-8"
+        json.dumps({"source": source, "chosen": chosen, "candidates": candidates}, indent=2),
+        encoding="utf-8",
     )
-    _log("hook", f"chosen {chosen['start']:.1f}s -> {chosen['end']:.1f}s "
+    _log("hook", f"[{source}] chosen {chosen['start']:.1f}s -> {chosen['end']:.1f}s "
                  f"score={chosen['score']} reasons={chosen['reasons']}")
     for alt in candidates[1:]:
         _log("hook", f"  alt {alt['start']:.1f}s -> {alt['end']:.1f}s score={alt['score']}")
+
+    # fraction of the (hook window | song) covered by sung words
+    lo, hi = (chosen["start"], chosen["end"]) if transcript.get("windowed") else (0.0, duration)
+    span = hi - lo
+    covered = sum(max(0.0, min(s["end"], hi) - max(s["start"], lo))
+                  for s in transcript["segments"])
+    coverage = min(1.0, covered / span) if span > 0 else 0.0
 
     # ---- Stage 3b: per-song visual theme + effect schedule for this hook
     theme = theme_mod.build_theme(
@@ -171,8 +258,32 @@ def run(args: argparse.Namespace) -> int:
         platforms=platforms, fps=args.fps, frames_mode=not args.record,
         workers=args.render_workers, direct=not args.no_direct,
     )
+    # Verify what actually landed on disk: an exported file under the
+    # minimum is deleted (never created, as far as the user is concerned)
+    # and the run fails; a length that disagrees with the hook window by
+    # more than a beat is called out instead of silently shipped.
+    expected = chosen["end"] - chosen["start"]
+    short = []
     for path in results:
-        _log("export", str(path))
+        try:
+            actual = analyze.probe_duration(str(path))
+        except RuntimeError:
+            _log("export", f"{path} (duration unverified)")
+            continue
+        if actual < hook_mod.MIN_VIDEO_SECONDS - 0.05:
+            _log("export", f"ERROR: {path.name} came out {actual:.2f}s - under the "
+                           f"{hook_mod.MIN_VIDEO_SECONDS:.0f}s minimum; deleting it")
+            path.unlink(missing_ok=True)
+            short.append(path)
+        elif abs(actual - expected) > 0.75:
+            _log("export", f"WARNING: {path.name} is {actual:.2f}s, "
+                           f"expected {expected:.2f}s")
+        else:
+            _log("export", f"{path} ({actual:.2f}s)")
+    if short:
+        return 1
+    _lap("render + export")
+    _log("time", f"total: {time.perf_counter() - t_start:.1f}s")
     _log("done", f"hook {chosen['start']:.1f}s-{chosen['end']:.1f}s of '{song.name}' -> {len(results)} short(s)")
     return 0
 
@@ -185,6 +296,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--language", default=None, help="force language (default: auto-detect)")
     ap.add_argument("--device", default="cpu", help="faster-whisper device (cpu/cuda)")
     ap.add_argument("--compute-type", default="int8", help="faster-whisper compute type")
+    ap.add_argument("--beam", type=int, default=1,
+                    help="beam size for the full-song pass (default 1 = greedy; the "
+                         "hook window always uses beam 5)")
+    ap.add_argument("--thorough", action="store_true",
+                    help="old behavior: beam 5 + word timestamps + temperature "
+                         "fallback over the whole song")
+    ap.add_argument("--full-transcribe", action="store_true",
+                    help="transcribe the whole song and score hooks on lyric repetition "
+                         "(old behavior; slow). Default: pick the hook from audio "
+                         "repetition and transcribe only the hook")
     ap.add_argument("--skip-transcribe", action="store_true",
                     help="reuse transcript.json from the output directory")
     ap.add_argument("--hook-len", type=float, default=30.0, help="hook length in seconds (default: 30)")

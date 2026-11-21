@@ -77,7 +77,9 @@ def frame_features(
     freqs = np.fft.rfftfreq(win, d=1.0 / sr)
     band_idx = np.clip(np.searchsorted(edges, freqs, side="right") - 1, 0, bands - 1)
 
-    n_frames = max(1, int(duration * fps))
+    # round, not truncate: int() systematically dropped the final partial
+    # frame, so every visual came out up to one frame shorter than its audio
+    n_frames = max(1, int(round(duration * fps)))
     spectrum = np.zeros((n_frames, bands), dtype=np.float32)
     rms = np.zeros(n_frames, dtype=np.float32)
     for f in range(n_frames):
@@ -150,3 +152,25 @@ def _beat_pulse(rms: np.ndarray, fps: int, thresh_k: float = 1.0) -> np.ndarray:
     for i in range(1, len(pulse)):
         pulse[i] = max(pulse[i], pulse[i - 1] * decay)
     return np.clip(pulse, 0.0, 1.0)
+
+
+def chroma_features(samples: np.ndarray, sr: int = SAMPLE_RATE, fps: int = 2,
+                    win: int = 8192) -> np.ndarray:
+    """12-bin pitch-class energy per frame, rows sum to 1: [frames, 12].
+    Used for audio-only repetition (chorus) detection; harmony repeats
+    where timbre alone may not."""
+    hop = max(1, int(round(sr / fps)))
+    n = max(1, int(len(samples) / hop))
+    window = np.hanning(win).astype(np.float32)
+    freqs = np.fft.rfftfreq(win, d=1.0 / sr)
+    sel = (freqs >= 65.0) & (freqs <= 2000.0)
+    pc = (np.round(12.0 * np.log2(freqs[sel] / 440.0) + 69.0).astype(int)) % 12
+    out = np.zeros((n, 12), dtype=np.float32)
+    for f in range(n):
+        c = f * hop
+        seg = samples[max(0, c - win // 2): c + win // 2]
+        if len(seg) < win:
+            seg = np.pad(seg, (0, win - len(seg)))
+        mag = np.abs(np.fft.rfft(seg * window))[sel]
+        out[f] = np.bincount(pc, weights=mag, minlength=12)
+    return out / np.maximum(out.sum(axis=1, keepdims=True), 1e-9)
