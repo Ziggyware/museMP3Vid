@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>museMP3Vid — hook studio</title>
+<style>
+  :root { --bg:#0e1013; --card:#16181d; --line:#262a33; --txt:#e9ebf0;
+          --dim:#9aa3b2; --acc:#ffb020; --acc2:#3ec6ff; --ok:#52d273; --err:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:15px/1.5 system-ui, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px 60px; }
+  header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  h1 { font-size:20px; margin:0; letter-spacing:.2px; }
+  h1 span { color:var(--acc); }
+  .song { color:var(--dim); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:16px; margin-bottom:14px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.12em;
+             color:var(--dim); margin:0 0 12px; font-weight:600; }
+  .card h2 b { color:var(--txt); text-transform:none; letter-spacing:0; font-size:14px; }
+  button { background:#22262f; color:var(--txt); border:1px solid var(--line);
+           border-radius:8px; padding:7px 14px; font-size:14px; cursor:pointer; }
+  button:hover { border-color:#3a4152; }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#191204; font-weight:600; }
+  button.primary:disabled { opacity:.45; cursor:default; }
+  button.danger { color:var(--err); }
+  input[type=number], input[type=text], select { background:#101216; color:var(--txt);
+    border:1px solid var(--line); border-radius:8px; padding:7px 9px; font-size:14px; }
+  input[type=text] { width:100%; }
+  input[type=color] { background:none; border:1px solid var(--line); border-radius:8px;
+    width:44px; height:34px; padding:2px; }
+  label { font-size:13px; color:var(--dim); display:flex; align-items:center; gap:6px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; }
+  canvas#wave { width:100%; height:132px; display:block; background:#0a0b0e;
+    border:1px solid var(--line); border-radius:10px; cursor:crosshair; touch-action:none; }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .chip { border:1px solid var(--line); background:#101216; border-radius:999px;
+          padding:5px 12px; font-size:13px; cursor:pointer; }
+  .chip:hover { border-color:var(--acc); }
+  .chip.active { border-color:var(--acc); color:var(--acc); }
+  .line { display:flex; gap:10px; align-items:center; margin-bottom:8px; }
+  .line .t { font:12px ui-monospace, Consolas, monospace; color:var(--dim);
+             white-space:nowrap; width:118px; }
+  .line input { flex:1; }
+  .ov { display:flex; gap:10px; align-items:center; padding:8px 0; border-top:1px solid var(--line); }
+  .ov:first-of-type { border-top:none; }
+  .ov .what { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ov .meta { color:var(--dim); font-size:12.5px; white-space:nowrap; }
+  .ov img { width:40px; height:40px; object-fit:cover; border-radius:6px; border:1px solid var(--line); }
+  .msg { font-size:13.5px; min-height:20px; }
+  .msg.ok { color:var(--ok); } .msg.err { color:var(--err); } .msg.dim { color:var(--dim); }
+  pre#log { background:#0a0b0e; border:1px solid var(--line); border-radius:10px;
+    padding:12px; font:12px/1.55 ui-monospace, Consolas, monospace; color:#c8cede;
+    max-height:260px; overflow:auto; white-space:pre-wrap; margin:10px 0 0; }
+  .results { display:flex; gap:14px; flex-wrap:wrap; margin-top:12px; }
+  .results figure { margin:0; width:180px; }
+  .results video { width:180px; border-radius:10px; border:1px solid var(--line); background:#000; }
+  .results figcaption { font-size:12.5px; color:var(--dim); margin-top:5px; word-break:break-all; }
+  .results a { color:var(--acc2); }
+  audio { width:100%; margin-top:10px; }
+  .hint { color:var(--dim); font-size:12.5px; margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>muse<span>MP3Vid</span> hook studio</h1>
+    <div class="song" id="songInfo">loading…</div>
+  </header>
+
+  <div class="card">
+    <h2>1 · Pick the hook &nbsp;<b id="selInfo"></b></h2>
+    <canvas id="wave"></canvas>
+    <audio id="aud" src="/media/song" controls preload="metadata"></audio>
+    <div class="row" style="margin-top:10px">
+      <label>start <input type="number" id="inStart" step="0.1" min="0" style="width:84px"></label>
+      <label>length <input type="number" id="inLen" step="0.5" min="10" max="120" style="width:84px"></label>
+      <button id="btnPlaySel">▶ Play selection</button>
+      <span class="grow"></span>
+      <label>hook length <input type="number" id="inHookLen" value="30" step="1" min="10" max="120" style="width:70px"></label>
+      <button id="btnCands">Find hooks</button>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="hint">Drag on the waveform to select. Shaded bands are the detected hooks — click one to use it.</div>
+  </div>
+
+  <div class="card">
+    <h2>2 · Lyrics</h2>
+    <div class="row">
+      <button class="primary" id="btnTranscribe">Transcribe selected hook</button>
+      <button id="btnRedo" class="danger" style="display:none">Redo transcription</button>
+      <span class="msg dim" id="lyrMsg">Transcription happens once per song — pick the hook first, then transcribe.</span>
+    </div>
+    <div id="lines" style="margin-top:12px"></div>
+    <div class="row" id="lyrSaveRow" style="display:none; margin-top:6px">
+      <button id="btnSaveLyrics">Save lyric edits</button>
+      <span class="hint" style="margin:0">Edits retime the words inside each line — no re-transcription.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3 · Overlays — images &amp; text on the video</h2>
+    <div class="row">
+      <input type="text" id="ovText" placeholder="Text to show…" style="flex:2; min-width:180px">
+      <select id="ovTextPos"></select>
+      <label>size <input type="number" id="ovTextSize" value="84" min="24" max="240" style="width:70px"></label>
+      <input type="color" id="ovTextColor" value="#ffffff">
+      <label>from <input type="number" id="ovTextStart" value="0" step="0.1" min="0" style="width:70px"></label>
+      <label>to <input type="number" id="ovTextEnd" value="3" step="0.1" min="0" style="width:70px"></label>
+      <button id="btnAddText">Add text</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input type="file" id="ovFile" accept="image/*" style="flex:2; min-width:180px">
+      <select id="ovImgPos"></select>
+      <label>width % <input type="number" id="ovImgWidth" value="35" min="5" max="100" style="width:70px"></label>
+      <label>from <input type="number" id="ovImgStart" value="0" step="0.1" min="0" style="width:70px"></label>
+      <label>to <input type="number" id="ovImgEnd" value="3" step="0.1" min="0" style="width:70px"></label>
+      <button id="btnAddImg">Add image</button>
+    </div>
+    <div class="hint">Times are seconds into the hook. Overlays save automatically.</div>
+    <div id="ovList" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h2>4 · Generate</h2>
+    <div class="row">
+      <label><input type="checkbox" class="plat" value="tiktok" checked> TikTok</label>
+      <label><input type="checkbox" class="plat" value="reels" checked> Reels</label>
+      <label><input type="checkbox" class="plat" value="shorts" checked> Shorts</label>
+      <button class="primary" id="btnGen">Generate video</button>
+      <span class="msg" id="genMsg"></span>
+    </div>
+    <pre id="log" style="display:none"></pre>
+    <div class="results" id="results"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fmt = t => { t = Math.max(0, t || 0); const m = Math.floor(t / 60), s = t - m * 60;
+                   return m + ":" + s.toFixed(1).padStart(4, "0"); };
+let S = { duration: 0, minWin: 10, peaks: [], hop: 0.25, cands: [], sel: { start: 0, end: 30 },
+          overlays: [], transcribed: false };
+const aud = $("aud");
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+const post = (path, obj) => api(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                        body: JSON.stringify(obj) });
+
+/* ---------- waveform ---------- */
+const cv = $("wave"), cx = cv.getContext("2d");
+function fitCanvas() {
+  const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+  cv.width = Math.round(r.width * d); cv.height = Math.round(r.height * d);
+}
+const x2t = x => x / cv.width * S.duration;
+const t2x = t => t / S.duration * cv.width;
+function draw() {
+  const W = cv.width, H = cv.height;
+  cx.clearRect(0, 0, W, H);
+  // candidate bands
+  S.cands.forEach((c, i) => {
+    cx.fillStyle = i === 0 ? "rgba(62,198,255,.13)" : "rgba(62,198,255,.06)";
+    cx.fillRect(t2x(c.start), 0, t2x(c.end) - t2x(c.start), H);
+  });
+  // selection
+  cx.fillStyle = "rgba(255,176,32,.16)";
+  cx.fillRect(t2x(S.sel.start), 0, t2x(S.sel.end) - t2x(S.sel.start), H);
+  cx.strokeStyle = "#ffb020"; cx.lineWidth = Math.max(2, W / 600);
+  cx.strokeRect(t2x(S.sel.start), 1, t2x(S.sel.end) - t2x(S.sel.start), H - 2);
+  // peaks
+  const n = S.peaks.length;
+  if (n) {
+    const max = Math.max(...S.peaks, 0.001);
+    cx.fillStyle = "#8b93a5";
+    const bw = Math.max(1, W / n);
+    for (let i = 0; i < n; i++) {
+      const h = Math.max(1, S.peaks[i] / max * (H - 14));
+      cx.fillRect(i / n * W, (H - h) / 2, bw, h);
+    }
+  }
+  // playhead
+  if (!aud.paused || aud.currentTime > 0) {
+    cx.fillStyle = "#fff";
+    cx.fillRect(t2x(aud.currentTime), 0, Math.max(1.5, W / 900), H);
+  }
+  $("selInfo").textContent = fmt(S.sel.start) + " – " + fmt(S.sel.end) +
+    "  (" + (S.sel.end - S.sel.start).toFixed(1) + "s)";
+  $("inStart").value = S.sel.start.toFixed(1);
+  $("inLen").value = (S.sel.end - S.sel.start).toFixed(1);
+}
+function setSel(start, end, skipDraw) {
+  start = Math.max(0, Math.min(start, S.duration - 1));
+  end = Math.max(start + 0.5, Math.min(end, S.duration));
+  if (end - start < S.minWin) end = Math.min(S.duration, start + S.minWin);
+  if (end - start < S.minWin) start = Math.max(0, end - S.minWin);
+  S.sel = { start: Math.round(start * 10) / 10, end: Math.round(end * 10) / 10 };
+  if (!skipDraw) draw();
+  syncOverlayDefaults();
+}
+let drag = null;
+cv.addEventListener("pointerdown", e => {
+  const r = cv.getBoundingClientRect();
+  const t = x2t((e.clientX - r.left) / r.width * cv.width);
+  drag = { a: t, moved: false };
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const r = cv.getBoundingClientRect();
+  const t = x2t((e.clientX - r.left) / r.width * cv.width);
+  if (Math.abs(t - drag.a) > 0.15) drag.moved = true;
+  if (drag.moved) setSel(Math.min(drag.a, t), Math.max(drag.a, t));
+});
+cv.addEventListener("pointerup", e => {
+  if (!drag) return;
+  if (!drag.moved) { aud.currentTime = drag.a; aud.play().catch(() => {}); }
+  drag = null;
+});
+$("inStart").addEventListener("change", () =>
+  setSel(parseFloat($("inStart").value) || 0, S.sel.start + (parseFloat($("inLen").value) || 30)));
+$("inLen").addEventListener("change", () =>
+  setSel(S.sel.start, S.sel.start + (parseFloat($("inLen").value) || 30)));
+$("btnPlaySel").addEventListener("click", () => { aud.currentTime = S.sel.start; aud.play().catch(() => {}); });
+aud.addEventListener("timeupdate", () => {
+  if (!aud.paused && aud.currentTime >= S.sel.end && aud.currentTime - S.sel.end < 1.5) aud.pause();
+  draw();
+});
+
+/* ---------- candidates ---------- */
+async function loadCands() {
+  const len = parseFloat($("inHookLen").value) || 30;
+  const j = await api("/api/candidates?len=" + len);
+  S.cands = j.candidates || [];
+  const box = $("chips"); box.innerHTML = "";
+  S.cands.forEach((c, i) => {
+    const b = document.createElement("button");
+    b.className = "chip" + (i === 0 ? " active" : "");
+    b.textContent = "Hook " + (i + 1) + " · " + fmt(c.start) + "–" + fmt(c.end) +
+                    (c.score != null ? " · " + Number(c.score).toFixed(2) : "");
+    b.onclick = () => { setSel(c.start, c.end);
+      box.querySelectorAll(".chip").forEach(x => x.classList.remove("active"));
+      b.classList.add("active"); };
+    box.appendChild(b);
+  });
+  if (S.cands.length) setSel(S.cands[0].start, S.cands[0].end); else draw();
+}
+$("btnCands").addEventListener("click", loadCands);
+
+/* ---------- lyrics ---------- */
+function renderLines(segments) {
+  const box = $("lines"); box.innerHTML = "";
+  segments.forEach(sg => {
+    const row = document.createElement("div"); row.className = "line";
+    const t = document.createElement("span"); t.className = "t";
+    t.textContent = fmt(sg.start) + " – " + fmt(sg.end);
+    const inp = document.createElement("input"); inp.type = "text"; inp.value = sg.text;
+    inp.dataset.start = sg.start; inp.dataset.end = sg.end;
+    row.append(t, inp); box.appendChild(row);
+  });
+  $("lyrSaveRow").style.display = segments.length ? "flex" : "none";
+}
+async function doTranscribe(retranscribe) {
+  const msg = $("lyrMsg");
+  msg.className = "msg dim"; msg.textContent = "Transcribing the selected hook… (Whisper, once)";
+  $("btnTranscribe").disabled = true;
+  try {
+    const j = await post("/api/transcribe",
+      { start: S.sel.start, end: S.sel.end, retranscribe: !!retranscribe });
+    renderLines(j.segments);
+    S.transcribed = true;
+    $("btnRedo").style.display = "";
+    msg.className = "msg ok";
+    msg.textContent = j.reused ? "Already transcribed — showing the stored lyrics."
+                               : "Transcribed. Edit any line, then save.";
+    if (!j.segments.length) msg.textContent += " (No singing heard in this window.)";
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+    if (/already has its one transcription/.test(e.message)) $("btnRedo").style.display = "";
+  } finally { $("btnTranscribe").disabled = false; }
+}
+$("btnTranscribe").addEventListener("click", () => doTranscribe(false));
+$("btnRedo").addEventListener("click", () => {
+  if (confirm("Redo the transcription for the currently selected hook? The stored lyrics will be replaced."))
+    doTranscribe(true);
+});
+$("btnSaveLyrics").addEventListener("click", async () => {
+  const segs = [...$("lines").querySelectorAll("input")].map(inp =>
+    ({ start: parseFloat(inp.dataset.start), end: parseFloat(inp.dataset.end), text: inp.value }));
+  try {
+    await post("/api/lyrics", { start: S.sel.start, end: S.sel.end, segments: segs });
+    const msg = $("lyrMsg"); msg.className = "msg ok"; msg.textContent = "Lyric edits saved.";
+  } catch (e) { const msg = $("lyrMsg"); msg.className = "msg err"; msg.textContent = e.message; }
+});
+
+/* ---------- overlays ---------- */
+function fillPositions(sel) {
+  (S.positions || ["top-center", "center", "bottom-center"]).forEach(p => {
+    const o = document.createElement("option"); o.value = p; o.textContent = p;
+    if (p === "top-center") o.selected = true;
+    sel.appendChild(o);
+  });
+}
+function syncOverlayDefaults() {
+  const len = Math.max(0.1, S.sel.end - S.sel.start);
+  $("ovTextEnd").value = Math.min(3, len).toFixed(1);
+  $("ovImgEnd").value = Math.min(3, len).toFixed(1);
+}
+function renderOverlays() {
+  const box = $("ovList"); box.innerHTML = "";
+  S.overlays.forEach((o, i) => {
+    const row = document.createElement("div"); row.className = "ov";
+    if (o.type === "image") {
+      const img = document.createElement("img"); img.src = "/media/out/" + o.path; row.appendChild(img);
+    }
+    const what = document.createElement("span"); what.className = "what";
+    what.textContent = o.type === "text" ? "“" + o.text + "”" : o.path.split("/").pop();
+    const meta = document.createElement("span"); meta.className = "meta";
+    meta.textContent = fmt(o.start) + "–" + fmt(o.end) + " · " + o.position +
+      (o.type === "text" ? " · " + o.size + "px" : " · " + Math.round(o.width_frac * 100) + "%");
+    const del = document.createElement("button"); del.textContent = "✕"; del.className = "danger";
+    del.onclick = async () => { S.overlays.splice(i, 1); await saveOverlays(); renderOverlays(); };
+    row.append(what, meta, del); box.appendChild(row);
+  });
+}
+async function saveOverlays() { await post("/api/overlays", { overlays: S.overlays }); }
+$("btnAddText").addEventListener("click", async () => {
+  const text = $("ovText").value.trim(); if (!text) return;
+  S.overlays.push({ type: "text", text, position: $("ovTextPos").value,
+    size: parseInt($("ovTextSize").value) || 84, color: $("ovTextColor").value,
+    start: parseFloat($("ovTextStart").value) || 0, end: parseFloat($("ovTextEnd").value) || 3 });
+  $("ovText").value = ""; await saveOverlays(); renderOverlays();
+});
+$("btnAddImg").addEventListener("click", async () => {
+  const f = $("ovFile").files[0]; if (!f) return;
+  const up = await api("/api/upload?name=" + encodeURIComponent(f.name),
+    { method: "POST", body: f });
+  S.overlays.push({ type: "image", path: up.path, position: $("ovImgPos").value,
+    width_frac: (parseFloat($("ovImgWidth").value) || 35) / 100,
+    start: parseFloat($("ovImgStart").value) || 0, end: parseFloat($("ovImgEnd").value) || 3 });
+  await saveOverlays(); renderOverlays();
+});
+
+/* ---------- generate ---------- */
+let pollTimer = null;
+$("btnGen").addEventListener("click", async () => {
+  const platforms = [...document.querySelectorAll(".plat:checked")].map(x => x.value);
+  const msg = $("genMsg");
+  try {
+    await post("/api/generate", { start: S.sel.start, end: S.sel.end, platforms });
+  } catch (e) { msg.className = "msg err"; msg.textContent = e.message; return; }
+  $("btnGen").disabled = true; msg.className = "msg dim"; msg.textContent = "Generating…";
+  $("log").style.display = "block"; $("results").innerHTML = "";
+  clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    const st = await api("/api/status");
+    const log = $("log"); log.textContent = st.log.join("\n"); log.scrollTop = log.scrollHeight;
+    if (!st.running) {
+      clearInterval(pollTimer); $("btnGen").disabled = false;
+      if (st.error) { msg.className = "msg err"; msg.textContent = st.error; }
+      else {
+        msg.className = "msg ok"; msg.textContent = "Done.";
+        const box = $("results");
+        st.results.forEach(name => {
+          const fig = document.createElement("figure");
+          const v = document.createElement("video");
+          v.controls = true; v.src = "/media/out/" + name;
+          const cap = document.createElement("figcaption");
+          cap.innerHTML = name + ' · <a href="/media/out/' + name + '" download>download</a>';
+          fig.append(v, cap); box.appendChild(fig);
+        });
+      }
+    }
+  }, 1500);
+});
+
+/* ---------- boot ---------- */
+(async () => {
+  const st = await api("/api/state");
+  S.duration = st.duration; S.minWin = st.min_window; S.positions = st.positions;
+  $("songInfo").textContent = st.song + " · " + fmt(st.duration) +
+    (st.transcribed_windows.length ? " · already transcribed" : "");
+  fillPositions($("ovTextPos")); fillPositions($("ovImgPos"));
+  const wf = await api("/api/waveform");
+  S.peaks = wf.peaks; S.hop = wf.hop;
+  const ov = await api("/api/overlays");
+  S.overlays = ov.overlays || []; renderOverlays();
+  fitCanvas(); setSel(0, Math.min(30, S.duration));
+  await loadCands();
+  // if this window already has lyrics, show them
+  const lyr = await api("/api/lyrics?start=" + S.sel.start + "&end=" + S.sel.end);
+  if (lyr.segments && lyr.segments.length) {
+    renderLines(lyr.segments);
+    $("lyrMsg").textContent = "Showing the stored lyrics for this window — edit and save.";
+    $("btnRedo").style.display = "";
+  }
+  window.addEventListener("resize", () => { fitCanvas(); draw(); });
+})();
+</script>
+</body>
+</html>

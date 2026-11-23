@@ -118,7 +118,7 @@ void main(){ vUv = p*0.5+0.5; gl_Position = vec4(p,0.0,1.0); }`;
 const FRAG = `
 precision highp float;
 varying vec2 vUv;
-uniform float uTime, uRMS, uPulse, uGlow, uHasCover, uBlend, uFrame, uHistH;
+uniform float uTime, uRMS, uPulse, uGlow, uHasCover, uBlend, uFrame, uHistH, uCheap;
 uniform int uMode, uModeNext;
 uniform vec4 uParams, uParamsNext;
 uniform vec2 uRes;
@@ -143,6 +143,119 @@ float fbm(vec2 p){
 }
 vec3 coverAt(vec2 cuv, float bright){
   return texture2D(uCover, clamp(cuv, 0.001, 0.999)).rgb * bright;
+}
+
+/* ---- pomterrain (mode 32): the FFT history as a heightfield, marched
+   with parallax-occlusion raycasting and lit (wrap diffuse + Blinn spec
+   + fresnel rim + crest emission), with distance fog. The lens (barrel
+   warp + chromatic aberration, both driven by the bass/beat) lives in
+   main(). Height = smoothed spectrum magnitude; x = frequency, z = time
+   into the past. ---- */
+float pomHfast(float x, float ago){
+  if (uCheap > 0.5) {
+    // software rasterizer: keep the z (time) smoothing - without it the
+    // march tunnels through thin features and the surface shreds - but
+    // drop the x taps (the texture is LINEAR-filtered now) and the detail.
+    float cn = histBand(x, ago - 1.6);
+    float cf = histBand(x, ago + 1.6);
+    float v = pow(clamp(histBand(x, ago)*0.36 + (cn + cf)*0.32, 0.0, 1.0), 1.35);
+    return v / (1.0 + v*0.35);
+  }
+  float c = histBand(x, ago);
+  float l = histBand(x - 0.014, ago);
+  float r = histBand(x + 0.014, ago);
+  float n = histBand(x, ago - 1.6);
+  float f = histBand(x, ago + 1.6);
+  float v = c*0.34 + (l + r)*0.13 + (n + f)*0.20;
+  v = pow(clamp(v, 0.0, 1.0), 1.35);
+  v = v / (1.0 + v*0.35);
+  float det = vnoise(vec2(x*90.0, ago*0.50)) - 0.5;
+  return clamp(v + det*0.045, 0.0, 1.0);
+}
+float pomH(float x, float ago){
+  float c = histBand(x, ago);
+  float l = histBand(x - 0.010, ago);
+  float r = histBand(x + 0.010, ago);
+  float n = histBand(x, ago - 1.5);
+  float f = histBand(x, ago + 1.5);
+  float v = c*0.40 + (l + r)*0.15 + (n + f)*0.15;
+  v = pow(clamp(v, 0.0, 1.0), 1.35);
+  v = v / (1.0 + v*0.35);
+  float det = vnoise(vec2(x*110.0, ago*0.55)) - 0.5;
+  return clamp(v + det*0.085, 0.0, 1.0);
+}
+float pomWin(float freq){ return smoothstep(0.0, 0.10, freq) * smoothstep(1.0, 0.90, freq); }
+float pomFade(float zw){ return smoothstep(0.15, 1.25, zw + 1.35); }
+float pomTerrH(vec2 xz, vec4 P, float hs){
+  float freq = 0.5 + xz.x * 0.36;
+  float ago = xz.y * (9.0 + P.w * 0.30);
+  return pomHfast(freq, ago) * pomWin(freq) * pomFade(xz.y) * hs;
+}
+vec3 pomSky(vec2 uv){
+  float lo = band(0.03);
+  vec3 sky = mix(pal(0.55)*0.16 + vec3(0.010, 0.012, 0.020),
+                 vec3(0.004, 0.005, 0.010), smoothstep(0.30, 1.05, uv.y));
+  float hg = pow(max(0.0, 1.0 - abs(uv.y - 0.415)), 6.0);
+  sky += pal(0.75) * hg * (0.07 + 0.16*lo + 0.08*uPulse);
+  vec2 sp = floor(uv * vec2(90.0, 160.0));
+  float star = step(0.997, hash(sp)) * (0.25 + 0.75*hash(sp + 7.0));
+  sky += vec3(0.9, 0.95, 1.0) * star * smoothstep(0.55, 1.0, uv.y) * 0.5;
+  return sky;
+}
+vec3 pomScene(vec2 uv, vec4 P){
+  float lo = band(0.03), hi = band(0.8);
+  float hs = (0.34 + 0.30*uRMS + 0.24*uPulse) * (0.55 + 0.45*P.z);
+  float camH = 1.15 + 0.10*sin(uTime*0.21*P.x) + 0.06*uPulse;
+  vec3 O = vec3(0.0, camH, -1.70);
+  vec3 D = normalize(vec3(uv.x*1.02, uv.y*0.82 - 0.30, 1.0));
+  vec3 L = normalize(vec3(-0.45, 0.78, -0.38));
+  vec3 fogC = mix(vec3(0.010, 0.012, 0.020), pal(0.45)*0.20, 0.55);
+  if (D.y >= 0.02) return pomSky(uv);
+  float tPrev = 0.05;
+  float dPrev = O.y - pomTerrH(O.xz + D.xz*tPrev, P, hs);
+  float tHit = -1.0, tA = 0.0, tB = 0.0, t = tPrev;
+  for (int i = 0; i < 56; i++) {
+    t = tPrev + 0.048 + tPrev*0.048;
+    vec3 pos = O + D*t;
+    float d = pos.y - pomTerrH(pos.xz, P, hs);
+    if (tHit < 0.0 && dPrev > 0.0 && d <= 0.0) { tHit = t; tA = tPrev; tB = t; }
+    tPrev = t; dPrev = d;
+  }
+  if (tHit < 0.0) return mix(fogC, pomSky(uv), smoothstep(0.05, 0.45, uv.y));
+  float a = tA, b = tB;
+  for (int j = 0; j < 4; j++) {
+    float m = 0.5*(a + b);
+    vec3 pm = O + D*m;
+    if (pm.y - pomTerrH(pm.xz, P, hs) > 0.0) a = m; else b = m;
+  }
+  tHit = 0.5*(a + b);
+  vec3 hit = O + D*tHit;
+  float rowsPerUnit = 9.0 + P.w * 0.30;
+  float freq = 0.5 + hit.x * 0.36;
+  float ago = hit.z * rowsPerUnit;
+  float win = pomWin(freq), fade = pomFade(hit.z);
+  float e1 = 0.012, e2 = 1.4;
+  float hC = pomH(freq, ago) * win * fade;
+  float hX = (pomH(freq + e1, ago) - pomH(freq - e1, ago)) * win * fade;
+  float hZ = (pomH(freq, ago + e2) - pomH(freq, ago - e2)) * win * fade;
+  vec3 N = normalize(vec3(-hX/(2.0*e1/0.36) * hs, 1.0,
+                          -hZ/(2.0*e2/rowsPerUnit) * hs));
+  vec3 V = normalize(O - hit);
+  vec3 Hv = normalize(L + V);
+  float diff = clamp((dot(N, L) + 0.35) / 1.35, 0.0, 1.0);
+  float spec = pow(max(dot(N, Hv), 0.0), 42.0) * (0.30 + 0.70*hi) * (0.55 + 0.65*uPulse);
+  spec *= (1.0 + 0.9*(1.0 - clamp(hC, 0.0, 1.0))) * clamp(N.y*1.6, 0.0, 1.0);
+  float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+  vec3 base = pal(0.08 + clamp(hC, 0.0, 1.0)*0.50);
+  base = mix(base, vec3(dot(base, vec3(0.3333))), 0.22);
+  vec3 lit = base * (0.20 + 0.95*diff);
+  lit *= 0.30 + 0.70*win*fade + 0.30*(1.0 - win*fade);
+  lit += pal(0.92) * spec * 1.1;
+  lit += pal(0.80) * fres * 0.35;
+  lit += pal(0.97) * smoothstep(0.70, 0.97, hC) * (0.30 + 0.85*uPulse + 0.35*lo) * 0.8;
+  lit *= 0.75 + 0.25*clamp(N.y, 0.0, 1.0);
+  float fog = 1.0 - exp(-tHit * 0.19);
+  return mix(lit, fogC, fog);
 }
 
 vec3 shade(int mode, vec4 P, vec2 uv, float r, float a){
@@ -471,7 +584,9 @@ vec3 shade(int mode, vec4 P, vec2 uv, float r, float a){
     float b = band(clamp(abs(la)*0.45, 0.0, 1.0));
     col = pal(la*0.35 + t*0.04) * (beams*1.6 + sweep*0.5) * (0.25 + b*1.2) * exp(-dist*0.75);
     col += pal(0.5) * exp(-dist*dist*22.0) * (0.6 + uPulse);
-  } else {                    // gears (31)
+  } else if (mode == 32) {    // pomterrain
+    col = pomScene(uv, P);
+  } else if (mode == 31) {    // gears
     col = pal(0.12) * 0.05;
     for (int k = 0; k < 2; k++) {
       float fk = float(k);
@@ -493,15 +608,29 @@ vec3 shade(int mode, vec4 P, vec2 uv, float r, float a){
   return col;
 }
 
+vec3 shadeFull(int mode, vec4 P, vec2 uv){
+  return shade(mode, P, uv, length(uv), atan(uv.y, uv.x));
+}
 void main(){
-  vec2 uv = vUv*2.0-1.0;
-  uv.x *= uRes.x/uRes.y;
-  float r = length(uv);
-  float a = atan(uv.y, uv.x);
-  vec3 col = shade(uMode, uParams, uv, r, a);
-  if (uBlend > 0.001) {
-    vec3 next = shade(uModeNext, uParamsNext, uv, r, a);
-    col = mix(col, next, uBlend);
+  vec2 uv0 = vUv*2.0-1.0;
+  uv0.x *= uRes.x/uRes.y;
+  float r = length(uv0);
+  /* Lens: barrel warp + chromatic aberration, both breathing with the
+     FFT (bass swells the warp, the beat kicks the fringe). Full strength
+     on the POM terrain, a whisper of it on the flat modes. */
+  float lo = band(0.03);
+  float pomW = (uMode == 32 || (uBlend > 0.001 && uModeNext == 32)) ? 1.0 : 0.3;
+  float k = (0.015 + 0.11*lo + 0.05*uPulse) * pomW;
+  vec2 uv = uv0 * (1.0 + k * r * r);
+  vec3 col;
+  if (uMode == 32 && uBlend < 0.001 && uCheap < 0.5) {
+    float ca = (0.0035 + 0.010*uPulse + 0.005*lo) * (0.35 + r);
+    col = vec3(shadeFull(uMode, uParams, uv * (1.0 + ca)).r,
+               shadeFull(uMode, uParams, uv).g,
+               shadeFull(uMode, uParams, uv * (1.0 - ca)).b);
+  } else {
+    col = shadeFull(uMode, uParams, uv);
+    if (uBlend > 0.001) col = mix(col, shadeFull(uModeNext, uParamsNext, uv), uBlend);
   }
   col *= uGlow;
   col += uPulse * 0.08 * vec3(0.4,0.8,1.0);
@@ -526,7 +655,7 @@ const loc = gl.getAttribLocation(prog, "p");
 gl.enableVertexAttribArray(loc);
 gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 const U = {};
-for (const name of ["uTime","uRMS","uPulse","uGlow","uHasCover","uBlend","uFrame","uHistH",
+for (const name of ["uTime","uRMS","uPulse","uGlow","uHasCover","uBlend","uFrame","uHistH","uCheap",
                     "uMode","uModeNext","uParams","uParamsNext","uRes",
                     "uSpec","uPal","uCover","uHist"]) {
   U[name] = gl.getUniformLocation(prog, name);
@@ -569,9 +698,17 @@ function uploadHistory(spectrum) {
     }
   }
   gl.deleteTexture(histTex);
-  histTex = makeTexture(3, 64, n, data, null, true);
+  histTex = makeTexture(3, 64, n, data, null, false);
   histH = n;
 }
+
+window.__softwareGL = (() => {
+  try {
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    const r = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : "";
+    return /swiftshader|software|llvmpipe/i.test(r);
+  } catch (e) { return false; }
+})();
 
 function drawFrame(spectrum, rms, pulse, time, frameIdx) {
   for (let i = 0; i < 64; i++) {
@@ -594,6 +731,7 @@ function drawFrame(spectrum, rms, pulse, time, frameIdx) {
   gl.uniform1f(U.uHasCover, coverTex ? 1 : 0);
   gl.uniform1f(U.uBlend, at.nxt ? at.blend : 0);
   gl.uniform1f(U.uFrame, frameIdx || 0);
+  gl.uniform1f(U.uCheap, window.__softwareGL ? 1 : 0);
   gl.uniform1f(U.uHistH, histH);
   gl.uniform1i(U.uMode, at.cur.mode);
   gl.uniform1i(U.uModeNext, at.nxt ? at.nxt.mode : at.cur.mode);
@@ -726,7 +864,9 @@ window.__encodeDirect = async function() {
     encoder.configure(cfg);
 
     const frameDur = Math.round(1e6 / fps);
+    window.__directFrames = 0;
     for (let i = 0; i < n; i++) {
+      window.__directFrames = i + 1;
       if (encError) throw encError;
       while (encoder.encodeQueueSize > 8) {
         await new Promise((r) => setTimeout(r, 5));

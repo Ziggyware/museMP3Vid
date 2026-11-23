@@ -3,8 +3,10 @@
 The visualizer page renders deterministically from frames.json. Capture
 paths, fastest first:
   - direct (default): the page encodes H.264 itself via WebCodecs, as fast
-    as it can draw, streaming chunks to visual.h264 over HTTP; ffmpeg only
-    muxes (-c copy). Falls back to frames on any failure.
+    as it can draw, streaming chunks to visual.h264 over HTTP; ffmpeg then
+    re-times the stream (frame-index timestamps at the page's fps) into
+    visual.mp4, and the frame count is verified against frames.json.
+    Falls back to frames on any failure.
   - frames: one screenshot per frame -> visual.mp4. Exact frame timing on
     any machine, including CPU-only SwiftShader rendering.
   - record (opt-in): canvas.captureStream + MediaRecorder inside headless
@@ -98,22 +100,35 @@ class _Server:
 
 
 def _launch_browser(pw, swiftshader: bool):
-    """Chromium launch. GPU (default ANGLE) first on real machines - forcing
-    SwiftShader everywhere made renders crawl on hardware that has a GPU.
-    SwiftShader remains the fallback for GPU-less environments."""
+    """Chromium launch, aiming at the REAL GPU.
+
+    Playwright's default headless launch uses the headless-shell build,
+    which is software-only (SwiftShader) no matter what ANGLE flags it
+    gets - on a machine with a GPU that silently turns every render into
+    a CPU crawl. The full Chromium build (channel="chromium") runs the
+    new headless mode, which can reach the GPU (ANGLE D3D11 on Windows)
+    and the hardware H.264 encoder. Try it first; if that build is not
+    installed, fall back to the default launch and let the page's
+    software-GL detection cheapen the heavy shaders instead."""
     args = ["--mute-audio", "--disable-dev-shm-usage"]
     if swiftshader:
         args += ["--enable-unsafe-swiftshader", "--use-angle=swiftshader"]
-    else:
-        # Real hardware: unblock the GPU and the accelerated video encoder
-        # (Media Foundation on Windows). Without these, headless Chromium
-        # software-encodes H.264 no matter what the page requests.
-        args += ["--ignore-gpu-blocklist", "--enable-accelerated-video-encode"]
-        import sys as _sys
+        return pw.chromium.launch(args=args)
+    # Real hardware: unblock the GPU and the accelerated video encoder
+    # (Media Foundation on Windows). Without these, headless Chromium
+    # software-encodes H.264 no matter what the page requests.
+    args += ["--ignore-gpu-blocklist", "--enable-accelerated-video-encode"]
+    import sys as _sys
 
-        if _sys.platform == "win32":
-            args.append("--use-angle=d3d11")
-    return pw.chromium.launch(args=args)
+    if _sys.platform == "win32":
+        args.append("--use-angle=d3d11")
+    try:
+        return pw.chromium.launch(channel="chromium", args=args,
+                                  ignore_default_args=["--disable-gpu"])
+    except Exception:  # noqa: BLE001 - full build missing: shell fallback
+        print("  [render] full Chromium build unavailable; using the "
+              "headless shell (software rendering likely)")
+        return pw.chromium.launch(args=args)
 
 
 def _capture_chunk(url: str, frames_dir: Path, indices: list[int],
@@ -124,9 +139,14 @@ def _capture_chunk(url: str, frames_dir: Path, indices: list[int],
     with sync_playwright() as pw:
         browser = _launch_browser(pw, swiftshader)
         page = browser.new_page(viewport={"width": WIDTH, "height": HEIGHT})
-        page.set_default_timeout(30000)
+        page.set_default_timeout(120000)
         page.goto(url)
         page.wait_for_function("window.__ready === true", timeout=20000)
+        if not progress.get("sw_note") and page.evaluate(
+                "window.__softwareGL === true"):
+            progress["sw_note"] = True
+            print("  [render] WebGL is SOFTWARE (SwiftShader) - the GPU "
+                  "was not reached; heavy effects run in cheap mode")
         for i in indices:
             page.evaluate(f"window.__drawFrame({i})")
             page.screenshot(path=str(frames_dir / f"frame_{i:05d}.jpg"),
@@ -137,12 +157,38 @@ def _capture_chunk(url: str, frames_dir: Path, indices: list[int],
         browser.close()
 
 
-def _direct_visual(job_dir: Path, url: str, duration: float, fps: int) -> Path:
+def _probe_stream(path: Path) -> tuple[int, float]:
+    """(frame count, duration in seconds) of a video stream via ffprobe.
+    Duration is NaN for raw streams that carry no timing."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+         "-show_entries", "stream=nb_read_frames,duration",
+         "-of", "json", str(path)],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffprobe failed for {path}: {proc.stderr[-300:]}")
+    stream = json.loads(proc.stdout)["streams"][0]
+    raw_dur = stream.get("duration")
+    dur = float(raw_dur) if raw_dur not in (None, "N/A") else float("nan")
+    return int(stream["nb_read_frames"]), dur
+
+
+def _direct_visual(job_dir: Path, url: str, duration: float, fps: int,
+                   n_expected: int) -> Path:
     """WebCodecs direct encode: the page encodes H.264 itself (as fast as it
     can draw, not real-time) and streams chunks to visual.h264 via
-    POST /chunk; ffmpeg then muxes with -c copy - no re-encode, no
-    screenshot files. Raises RuntimeError on any failure so the caller can
-    fall back to frame capture."""
+    POST /chunk. Raises RuntimeError on any failure so the caller can
+    fall back to frame capture.
+
+    The mux does NOT stream-copy: a raw Annex B stream has no timestamps
+    of its own, so a copy-mux lets ffmpeg guess each frame's timing from
+    whatever the encoder wrote into the SPS - and a hardware encoder's
+    guess can be wildly wrong (one user's stream played 10s of frames in
+    ~1s, after which the composed short held the last frame for the
+    remaining 9). Instead the frames are re-timed from their index
+    (setpts=N) at the page's fps and re-encoded, and the result is
+    verified against the frame count in frames.json before it is
+    trusted."""
     from playwright.sync_api import sync_playwright
 
     h264_path = job_dir / "visual.h264"
@@ -179,9 +225,12 @@ def _direct_visual(job_dir: Path, url: str, duration: float, fps: int) -> Path:
             # while bytes keep arriving the encode is alive, not stuck.
             import time as _time
 
-            deadline = _time.monotonic() + max(300.0, duration * 45.0)
+            deadline = _time.monotonic() + max(600.0, duration * 20.0)
+            started = _time.monotonic()
             last_print = 0.0
             announced = False
+            last_bytes = 0
+            last_change = started
             while True:
                 if page.evaluate("window.__directDone === true"):
                     break
@@ -189,20 +238,45 @@ def _direct_visual(job_dir: Path, url: str, duration: float, fps: int) -> Path:
                         "window.__directHwAccel !== undefined"):
                     hw = page.evaluate("window.__directHwAccel")
                     renderer = page.evaluate("window.__glRenderer || 'unknown'")
-                    if hw:
+                    software_gl = page.evaluate("window.__softwareGL === true")
+                    # The encoder config check alone lies: Chromium will
+                    # accept prefer-hardware while WebGL is SwiftShader
+                    # and everything still crawls. HARDWARE is claimed
+                    # only when the GL renderer is real silicon too.
+                    if hw and not software_gl:
                         print(f"  [render] direct encode: HARDWARE H.264 "
                               f"(WebGL: {renderer})")
                     else:
-                        print("  [render] direct encode: SOFTWARE H.264 - no "
-                              f"hardware encoder answered (WebGL: {renderer}); "
-                              "this will be slow")
+                        print("  [render] direct encode: SOFTWARE H.264 - "
+                              f"the GPU was not reached (WebGL: {renderer}); "
+                              "heavy effects run in cheap mode, expect slow")
                     announced = True
                 now = _time.monotonic()
                 if now > deadline:
                     raise RuntimeError("direct encode timed out")
+                # Pace watchdog: never again burn 20+ minutes discovering
+                # the encode is crawling. Once enough frames are in,
+                # project the total; if it is hopeless, bail to frame
+                # capture while that is still cheap.
+                elapsed = now - started
+                frames_done = page.evaluate("window.__directFrames || 0")
+                if elapsed > 45.0 and frames_done >= 30:
+                    projected = elapsed / frames_done * n_expected
+                    if projected > max(240.0, duration * 10.0):
+                        raise RuntimeError(
+                            f"direct encode too slow ({frames_done} frames "
+                            f"in {elapsed:.0f}s, ~{projected / 60.0:.0f} min "
+                            "projected); falling back to frame capture")
+                sent_now = page.evaluate("window.__directBytes || 0")
+                if sent_now != last_bytes:
+                    last_bytes = sent_now
+                    last_change = now
+                elif now - last_change > 90.0 and elapsed > 90.0:
+                    raise RuntimeError(
+                        "direct encode stalled (no data for 90s); "
+                        "falling back to frame capture")
                 if now - last_print >= 30.0:
-                    sent = page.evaluate("window.__directBytes || 0")
-                    print(f"  [render] direct encode streaming... {sent} bytes")
+                    print(f"  [render] direct encode streaming... {last_bytes} bytes")
                     last_print = now
                 _time.sleep(2.0)
             error = page.evaluate("window.__directError")
@@ -214,12 +288,30 @@ def _direct_visual(job_dir: Path, url: str, duration: float, fps: int) -> Path:
     if not h264_path.exists() or h264_path.stat().st_size == 0:
         raise RuntimeError("direct encode produced no H.264 data")
     print(f"  [render] direct encode: {nbytes} bytes streamed from the page; muxing...")
+    # The page encoded n_expected frames; if the stream on disk holds
+    # materially fewer, the encoder dropped them (seen with hardware
+    # encoders fed faster than real time) and no mux can invent them
+    # back - fail over to frame capture instead of shipping a stub.
+    got, _ = _probe_stream(h264_path)
+    if got < int(n_expected * 0.98):
+        raise RuntimeError(
+            f"direct encode: stream holds {got} of {n_expected} frames; "
+            "falling back to frame capture")
     visual = job_dir / "visual.mp4"
     _run([
         "ffmpeg", "-y", "-v", "error",
         "-framerate", str(fps), "-i", str(h264_path),
-        "-c", "copy", "-movflags", "+faststart", str(visual),
+        "-vf", f"setpts=N/({fps}*TB)",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+        "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-movflags", "+faststart", str(visual),
     ])
+    got, dur = _probe_stream(visual)
+    if got < int(n_expected * 0.98) or not (abs(dur - duration) <= 0.6):
+        raise RuntimeError(
+            f"direct encode: muxed visual is {got} frames / {dur:.2f}s, "
+            f"expected {n_expected} / {duration:.2f}s; "
+            "falling back to frame capture")
     return visual
 
 
@@ -248,7 +340,7 @@ def render_visualizer(job_dir: Path, duration: float, fps: int = 30,
             return _record_visual(job_dir, full_url, duration)
         if direct:
             try:
-                return _direct_visual(job_dir, full_url, duration, fps)
+                return _direct_visual(job_dir, full_url, duration, fps, n_frames)
             except Exception as exc:  # noqa: BLE001 - frames path is the fallback
                 print(f"  [render] direct encode unavailable ({exc}); "
                       "falling back to frame capture")
@@ -330,8 +422,98 @@ def fallback_visual(hook_audio: Path, duration: float, out_path: Path) -> Path:
     return out_path
 
 
+# ---- user overlays (overlays.json in the job dir, written by the UI) ----
+# Each overlay: {"type": "image"|"text", "start": s, "end": s (hook-relative
+# seconds), "position": preset, ...}. Images carry "path" (relative to the
+# job dir) and "width_frac" (of the 1080-wide frame); text carries "text",
+# "size" (ASS px) and "color" (#RRGGBB). compose() burns them over the
+# visual, under nothing else - they are the topmost layer.
+OVERLAY_POSITIONS = ("top-left", "top-center", "top-right", "center",
+                     "bottom-left", "bottom-center", "bottom-right")
+_ASS_ALIGN = {"top-left": 7, "top-center": 8, "top-right": 9, "center": 5,
+              "bottom-left": 1, "bottom-center": 2, "bottom-right": 3}
+_OVERLAY_XY = {
+    "top-left": ("W*0.04", "H*0.06"), "top-center": ("(W-w)/2", "H*0.06"),
+    "top-right": ("W*0.96-w", "H*0.06"), "center": ("(W-w)/2", "(H-h)/2"),
+    "bottom-left": ("W*0.04", "H*0.94-h"), "bottom-center": ("(W-w)/2", "H*0.94-h"),
+    "bottom-right": ("W*0.96-w", "H*0.94-h"),
+}
+
+
+def _ass_ts(seconds: float) -> str:
+    cs = int(round(seconds * 100))
+    return f"{cs // 360000}:{(cs // 6000) % 60:02d}:{(cs // 100) % 60:02d}.{cs % 100:02d}"
+
+
+def write_text_overlays_ass(overlays: list[dict], path: Path) -> Path:
+    """Render the text overlays as an ASS file at the captions' own
+    resolution (1080x1920), one Dialogue per overlay, hook-relative times."""
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", "PlayResX: 1080", "PlayResY: 1920",
+        "WrapStyle: 2", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Overlay,Arial,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,"
+        "1,0,0,0,100,100,0,0,1,4,0,8,60,60,110,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for o in overlays:
+        pos = o.get("position", "top-center")
+        align = _ASS_ALIGN.get(pos, 8)
+        size = int(o.get("size", 72))
+        hexcol = str(o.get("color", "#FFFFFF")).lstrip("#")
+        bgr = hexcol[4:6] + hexcol[2:4] + hexcol[0:2] if len(hexcol) == 6 else "FFFFFF"
+        text = str(o.get("text", "")).replace("\\", "").replace("{", "\\{").replace("}", "\\}")
+        text = text.replace("\r\n", "\\N").replace("\n", "\\N")
+        lines.append(
+            f"Dialogue: 1,{_ass_ts(float(o['start']))},{_ass_ts(float(o['end']))},"
+            f"Overlay,,0,0,0,,{{\\an{align}\\fs{size}\\c&H{bgr}&}}{text}"
+        )
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return Path(path)
+
+
+def validate_overlays(raw, job_dir: Path) -> list[dict]:
+    """Clean an overlays list (from the UI or a hand-written file) into
+    the schema compose() consumes. Bad entries are dropped, values are
+    clamped; image paths must resolve inside the job dir."""
+    out = []
+    for o in raw or []:
+        if not isinstance(o, dict):
+            continue
+        try:
+            start = max(0.0, float(o.get("start", 0.0)))
+            end = float(o.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        pos = o.get("position") if o.get("position") in OVERLAY_POSITIONS else "top-center"
+        if o.get("type") == "image":
+            rel = str(o.get("path", ""))
+            full = (job_dir / rel).resolve()
+            if not full.is_file() or job_dir.resolve() not in full.parents:
+                continue
+            out.append({"type": "image", "path": rel, "start": start, "end": end,
+                        "position": pos,
+                        "width_frac": min(1.0, max(0.05, float(o.get("width_frac", 0.35))))})
+        elif o.get("type") == "text":
+            text = str(o.get("text", "")).strip()
+            if not text:
+                continue
+            out.append({"type": "text", "text": text[:200], "start": start, "end": end,
+                        "position": pos, "size": min(240, max(24, int(o.get("size", 72)))),
+                        "color": str(o.get("color", "#FFFFFF"))})
+    return out
+
+
 def compose(visual: Path, hook_audio: Path, ass_path: Path | None, out_path: Path,
-            duration: float | None = None) -> Path:
+            duration: float | None = None, overlays: list[dict] | None = None) -> Path:
     """Burn captions (ASS) over the visual and mux the hook audio.
 
     When `duration` (the hook window length) is known, the output is
@@ -345,13 +527,48 @@ def compose(visual: Path, hook_audio: Path, ass_path: Path | None, out_path: Pat
     visual = Path(visual).resolve()
     hook_audio = Path(hook_audio).resolve()
     out_path = Path(out_path).resolve()
+    base_dir = visual.parent
+    overlays = overlays or []
+    images = [o for o in overlays if o.get("type") == "image"]
+    texts = [o for o in overlays if o.get("type") == "text"]
+    text_ass = None
+    if texts:
+        text_ass = write_text_overlays_ass(texts, base_dir / "overlays_text.ass")
+    have_ass = ass_path is not None and Path(ass_path).exists()
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(visual), "-i", str(hook_audio)]
+    for o in images:
+        cmd += ["-i", str((base_dir / o["path"]).resolve())]
     cwd = None
-    if ass_path is not None and ass_path.exists():
-        cmd += ["-vf", f"ass={ass_path.name}"]
-        cwd = str(Path(ass_path).resolve().parent)
+    if images:
+        chains = []
+        cur = "0:v"
+        for i, o in enumerate(images):
+            w = max(2, int(round(WIDTH * float(o.get("width_frac", 0.35)) / 2)) * 2)
+            x, y = _OVERLAY_XY.get(o.get("position", "top-center"),
+                                   _OVERLAY_XY["top-center"])
+            chains.append(f"[{2 + i}:v]scale={w}:-2[ov{i}]")
+            chains.append(
+                f"[{cur}][ov{i}]overlay={x}:{y}:"
+                f"enable='between(t,{float(o['start']):.3f},{float(o['end']):.3f})'[v{i}]")
+            cur = f"v{i}"
+        ass_names = ([Path(ass_path).name] if have_ass else []) + \
+                    ([text_ass.name] if text_ass else [])
+        for j, name in enumerate(ass_names):
+            chains.append(f"[{cur}]ass={name}[a{j}]")
+            cur = f"a{j}"
+        cmd += ["-filter_complex", ";".join(chains), "-map", f"[{cur}]", "-map", "1:a"]
+        cwd = str(base_dir)
+    else:
+        vf = []
+        if have_ass:
+            vf.append(f"ass={Path(ass_path).name}")
+        if text_ass:
+            vf.append(f"ass={text_ass.name}")
+        if vf:
+            cmd += ["-vf", ",".join(vf)]
+            cwd = str(base_dir)
+        cmd += ["-map", "0:v", "-map", "1:a"]
     cmd += [
-        "-map", "0:v", "-map", "1:a",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
         "-pix_fmt", "yuv420p", "-r", "30",
         "-c:a", "aac", "-b:a", "192k",
@@ -387,13 +604,22 @@ def export_shorts(
         print(f"  [render] WebGL capture unavailable ({exc}); using ffmpeg fallback visual")
         visual = fallback_visual(hook_audio, duration, job_dir / "visual.mp4")
 
+    overlays = None
+    ov_path = job_dir / "overlays.json"
+    if ov_path.exists():
+        try:
+            overlays = validate_overlays(
+                json.loads(ov_path.read_text(encoding="utf-8")), job_dir)
+        except Exception:  # noqa: BLE001 - a bad overlays file must not kill the export
+            overlays = None
     results = []
     for platform in platforms:
         preset = PLATFORM_PRESETS[platform]
         platform_ass = job_dir / f"captions_{platform}.ass"
         ass_path = platform_ass if platform_ass.exists() else job_dir / "captions.ass"
         out_path = out_dir / f"{song_stem}_hook_{preset['suffix']}.mp4"
-        compose(visual, hook_audio, ass_path, out_path, duration=duration)
+        compose(visual, hook_audio, ass_path, out_path, duration=duration,
+                overlays=overlays)
         post = out_dir / f"{song_stem}_hook_{preset['suffix']}.post.txt"
         post.write_text(
             f"{song_stem} - the hook\n#music #newmusic #hook #shorts\n",

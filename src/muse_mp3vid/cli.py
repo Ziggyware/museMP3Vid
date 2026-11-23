@@ -19,7 +19,7 @@ import numpy as np
 
 from . import analyze, captions as captions_mod, hook as hook_mod, render as render_mod, theme as theme_mod
 from .transcribe import (flatten_words, load_transcript, refine_window, save_transcript,
-                         transcribe_audio, window_needs_words)
+                         song_fingerprint, transcribe_audio, window_needs_words)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -36,6 +36,13 @@ def run(args: argparse.Namespace) -> int:
     out_dir = Path(args.out).resolve() if args.out else Path.cwd() / "out" / song.stem
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = song.stem.replace(" ", "_")
+
+    if getattr(args, "ui", False):
+        from . import ui as ui_mod
+        return ui_mod.serve(song, out_dir, port=args.ui_port, model=args.model,
+                            device=args.device, compute_type=args.compute_type,
+                            language=args.language, fast=args.fast,
+                            fps=args.fps, direct=not args.no_direct)
 
     lap = time.perf_counter()
     t_start = lap
@@ -59,34 +66,54 @@ def run(args: argparse.Namespace) -> int:
         print(f"unknown platforms: {bad}", file=sys.stderr)
         return 2
 
-    # ---- Stage 2: transcription. Default is hook-only: Whisper never sees
-    # the rest of the song. --full-transcribe restores whole-song
-    # transcription + lyric-repetition hook scoring.
+    # ---- Stage 2: transcription - exactly once per song, ever. If
+    # transcript.json already holds this song's transcription (matched by
+    # file size + mtime fingerprint), it is reused and Whisper never runs
+    # again; --retranscribe is the explicit escape hatch. Default mode is
+    # hook-only: the one transcription is the hook-window pass in stage 3a.
+    # --full-transcribe makes the one transcription a whole-song pass
+    # (with word timestamps, so no window pass follows it).
     transcript_path = out_dir / "transcript.json"
-    if args.skip_transcribe and transcript_path.exists():
-        transcript = load_transcript(transcript_path)
-        _log("transcribe", f"reused {transcript_path}")
-    elif args.full_transcribe:
-        _log("transcribe", f"Whisper '{args.model}' on {song.name} (whole song) ...")
-        transcript = transcribe_audio(
-            song,
-            model_size=args.model,
-            language=args.language,
-            device=args.device,
-            compute_type=args.compute_type,
-            beam_size=5 if args.thorough else args.beam,
-            word_timestamps=args.thorough,
-            fallback=args.thorough,
-        )
-        save_transcript(transcript, transcript_path)
-    else:
-        transcript = {
-            "language": args.language, "language_probability": None,
-            "duration": round(song_duration, 3), "model": args.model,
-            "vad_fallback": False, "windowed": True, "refined_windows": [],
-            "segments": [],
-        }
-        _log("transcribe", "hook-only mode: Whisper runs on the chosen hook, not the song")
+    fingerprint = song_fingerprint(song)
+    transcript = None
+    transcribed_this_run = False
+    reused_transcript = False
+    if transcript_path.exists() and not args.retranscribe:
+        stored = load_transcript(transcript_path)
+        fp = stored.get("source_fingerprint")
+        if fp is None and abs(float(stored.get("duration") or -1) - song_duration) <= 0.6:
+            fp = fingerprint  # legacy transcript of this song: adopt + stamp
+        if fp == fingerprint or args.skip_transcribe:
+            transcript = stored
+            reused_transcript = True
+            _log("transcribe", "transcript.json already holds this song's "
+                               "transcription - reusing it, Whisper will not "
+                               "run again (--retranscribe to redo it)")
+    if transcript is None:
+        if args.full_transcribe:
+            _log("transcribe", f"Whisper '{args.model}' on {song.name} (whole song) ...")
+            transcript = transcribe_audio(
+                song,
+                model_size=args.model,
+                language=args.language,
+                device=args.device,
+                compute_type=args.compute_type,
+                beam_size=5 if args.thorough else args.beam,
+                word_timestamps=True,
+                fast=args.fast,
+            )
+            transcribed_this_run = True
+        else:
+            transcript = {
+                "language": args.language, "language_probability": None,
+                "duration": round(song_duration, 3), "model": args.model,
+                "vad_fallback": False, "windowed": True, "refined_windows": [],
+                "segments": [],
+            }
+            _log("transcribe", "hook-only mode: Whisper runs on the chosen hook, not the song")
+        transcript["source_fingerprint"] = fingerprint
+        if args.full_transcribe:
+            save_transcript(transcript, transcript_path)
     # The decoded PCM length is the authority on how long the song is. A
     # transcript's duration comes from container/Whisper metadata and can
     # disagree (MP3 padding estimates, a stale reused transcript); windows
@@ -152,15 +179,25 @@ def run(args: argparse.Namespace) -> int:
         candidates[0] = chosen
     _lap("hook detection")
 
-    # ---- Stage 3a: word timings for the hook window only
+    # ---- Stage 3a: word timings for the hook window - this is the one
+    # transcription in hook-only mode, and it may only run if no
+    # transcription exists yet (not this run, not a previous one).
     if window_needs_words(transcript, chosen["start"], chosen["end"]):
-        _log("transcribe", f"Whisper on hook {chosen['start']:.1f}s-{chosen['end']:.1f}s ...")
-        transcript = refine_window(song, transcript, chosen["start"], chosen["end"],
-                                   model_size=args.model, device=args.device,
-                                   compute_type=args.compute_type, language=args.language,
-                                   pad=3.0 if source == "audio" else 1.0)
-        save_transcript(transcript, transcript_path)
-        _lap("transcribe (hook window)")
+        if transcribed_this_run or reused_transcript:
+            _log("transcribe", "WARNING: this window has no word timings, but "
+                               "the song's one transcription already exists - "
+                               "captions use the stored transcript as-is "
+                               "(--retranscribe to redo transcription)")
+        else:
+            _log("transcribe", f"Whisper on hook {chosen['start']:.1f}s-{chosen['end']:.1f}s "
+                               f"({'fast profile' if args.fast else 'quality profile'}) ...")
+            transcript = refine_window(song, transcript, chosen["start"], chosen["end"],
+                                       model_size=args.model, device=args.device,
+                                       compute_type=args.compute_type, language=args.language,
+                                       pad=3.0 if source == "audio" else 1.0,
+                                       fast=args.fast)
+            save_transcript(transcript, transcript_path)
+            _lap("transcribe (hook window)")
     if source == "audio":
         # audio-detected starts land on a 0.5 s grid: pull to a sung-line start
         # (the fit check uses the enforced window length, not the raw
@@ -300,14 +337,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="beam size for the full-song pass (default 1 = greedy; the "
                          "hook window always uses beam 5)")
     ap.add_argument("--thorough", action="store_true",
-                    help="old behavior: beam 5 + word timestamps + temperature "
-                         "fallback over the whole song")
+                    help="beam 5 (instead of greedy) for the whole-song pass")
     ap.add_argument("--full-transcribe", action="store_true",
                     help="transcribe the whole song and score hooks on lyric repetition "
                          "(old behavior; slow). Default: pick the hook from audio "
                          "repetition and transcribe only the hook")
     ap.add_argument("--skip-transcribe", action="store_true",
                     help="reuse transcript.json from the output directory")
+    ap.add_argument("--retranscribe", action="store_true",
+                    help="redo the song's one transcription even though "
+                         "transcript.json already holds it")
+    ap.add_argument("--fast", action="store_true",
+                    help="fast transcription: greedy decoding (beam 1), no "
+                         "temperature-fallback re-decodes, tighter hook "
+                         "window pad. Several times faster on CPU; captions "
+                         "may mishear a few more words")
     ap.add_argument("--hook-len", type=float, default=30.0, help="hook length in seconds (default: 30)")
     ap.add_argument("--hook-start", type=float, default=None,
                     help="override hook start (seconds); skips detection")
@@ -332,6 +376,12 @@ def main(argv: list[str] | None = None) -> int:
                          "per-frame screenshot capture instead")
     ap.add_argument("--no-render", action="store_true",
                     help="stop after captions + visualizer data (no video)")
+    ap.add_argument("--ui", action="store_true",
+                    help="open the local web UI: pick the hook on a waveform, "
+                         "transcribe it, edit lyrics, add image/text overlays, "
+                         "then generate")
+    ap.add_argument("--ui-port", type=int, default=8765,
+                    help="port for --ui (default: 8765)")
     args = ap.parse_args(argv)
     try:
         return run(args)

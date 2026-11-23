@@ -133,19 +133,19 @@ def segment_coverage(segments: list[dict], duration: float) -> float:
 
 
 def _transcribe_once(model, samples, language, beam_size, vad_filter,
-                     word_timestamps=True, fallback=True):
-    kw = {}
-    if not fallback:
-        # Default temperature ladder re-decodes any low-confidence segment up
-        # to 5 more times (best_of=5); sung vocals trip it constantly.
-        kw["temperature"] = 0.0
+                     word_timestamps=True):
+    # temperature is pinned to 0.0, always: faster-whisper's default
+    # temperature ladder re-decodes any low-confidence segment up to 5
+    # more times, and sung vocals trip it constantly. Transcription in
+    # this pipeline happens exactly once - one decode, no re-tries at
+    # any level (no ladder, no VAD retry, no second window pass).
     segments_iter, info = model.transcribe(
         samples,
         language=language,
         beam_size=beam_size,
         word_timestamps=word_timestamps,
         vad_filter=vad_filter,
-        **kw,
+        temperature=0.0,
     )
     segments = []
     for seg in segments_iter:
@@ -178,7 +178,7 @@ def transcribe_audio(
     language: str | None = None,
     beam_size: int = 5,
     word_timestamps: bool = True,
-    fallback: bool = True,
+    fast: bool = False,
 ) -> dict:
     """Transcribe an audio file. Returns a JSON-serializable dict:
 
@@ -189,35 +189,23 @@ def transcribe_audio(
                     "words": [{"start", "end", "word", "probability"}]}]
     }
 
-    faster-whisper's VAD is tuned for speech and can strip sung vocals out
-    of a song entirely (near-empty transcript -> no captions, no sections).
-    If the VAD pass covers < 25% of a song-length file, retry without VAD
-    and keep whichever pass heard more of the song.
+    Single pass, VAD off: faster-whisper's VAD is tuned for speech and
+    can strip sung vocals out of a song entirely (near-empty transcript
+    -> no captions, no sections), and this pipeline transcribes exactly
+    once - so the one pass is the one that hears the whole song.
     """
+    if fast:
+        beam_size = 1  # fast profile: greedy decoding
     model = _load_model(model_size, device, compute_type)
     samples = _decode_for_whisper(audio_path)
-    segments, info = _transcribe_once(model, samples, language, beam_size, True,
-                                      word_timestamps, fallback)
-    duration = float(info.duration)
-    coverage = segment_coverage(segments, duration)
-    vad_fallback = False
-    if duration >= 20.0 and coverage < 0.25:
-        print(f"  [transcribe] VAD pass covered only {coverage:.0%} of the song; "
-              "retrying without VAD (VAD strips sung vocals)...")
-        segments2, info2 = _transcribe_once(model, samples, language, beam_size, False,
-                                            word_timestamps, fallback)
-        coverage2 = segment_coverage(segments2, float(info2.duration))
-        if coverage2 > coverage:
-            segments, info, coverage = segments2, info2, coverage2
-            vad_fallback = True
-        print(f"  [transcribe] no-VAD coverage {coverage2:.0%}; "
-              f"using {'no-VAD' if vad_fallback else 'VAD'} pass")
+    segments, info = _transcribe_once(model, samples, language, beam_size, False,
+                                      word_timestamps)
     return {
         "language": info.language,
         "language_probability": round(info.language_probability, 4),
         "duration": round(info.duration, 3),
         "model": model_size,
-        "vad_fallback": vad_fallback,
+        "vad_fallback": False,
         "segments": segments,
     }
 
@@ -247,26 +235,24 @@ def refine_window(
     beam_size: int = 5,
     pad: float = 1.0,
     language: str | None = None,
+    fast: bool = False,
 ) -> dict:
     """Re-transcribe only the hook window with word timestamps and beam
     search, then splice it over the coarse segments it replaces. Captions
     need word timings for ~30 s, not for the whole song. Returns a new
     transcript dict; the input is not mutated."""
+    if fast:
+        beam_size, pad = 1, min(pad, 1.5)
     lo = max(0.0, start - pad)
     hi = end + pad
     model = _load_model(model_size, device, compute_type)
     samples = _decode_for_whisper(audio_path, lo, hi)
     lang = transcript.get("language") or language
-    vad = not transcript.get("vad_fallback", False)
-    segs, info = _transcribe_once(model, samples, lang, beam_size, vad,
-                                  word_timestamps=True, fallback=True)
-    span = hi - lo
-    if vad and span >= 20.0 and segment_coverage(segs, span) < 0.25:
-        # VAD can strip sung vocals entirely; keep whichever pass heard more
-        segs2, info2 = _transcribe_once(model, samples, lang, beam_size, False,
-                                        word_timestamps=True, fallback=True)
-        if segment_coverage(segs2, span) > segment_coverage(segs, span):
-            segs, info, vad = segs2, info2, False
+    # One pass, VAD off - same reasoning as transcribe_audio: the window
+    # is transcribed exactly once, so the pass must be the one that
+    # hears sung vocals instead of filtering them out as non-speech.
+    segs, info = _transcribe_once(model, samples, lang, beam_size, False,
+                                  word_timestamps=True)
     for s in segs:  # window-relative -> song-absolute
         s["start"] = round(s["start"] + lo, 3)
         s["end"] = round(s["end"] + lo, 3)
@@ -281,10 +267,64 @@ def refine_window(
     out["segments"] = merged
     out["refined_window"] = [round(lo, 3), round(hi, 3)]
     out["refined_windows"] = list(transcript.get("refined_windows", [])) + [[round(lo, 3), round(hi, 3)]]
-    out["vad_fallback"] = not vad
+    out["vad_fallback"] = False
     if not out.get("language"):
         out["language"] = info.language
         out["language_probability"] = round(info.language_probability, 4)
+    return out
+
+
+def song_fingerprint(path: str | Path) -> dict:
+    """Identity of a song file for transcript reuse: size + mtime. A
+    transcript stamped with this fingerprint IS this song's one
+    transcription; anything else is a different song's."""
+    st = Path(path).stat()
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _words_for_text(text: str, start: float, end: float) -> list[dict]:
+    """Word timings for hand-edited lyric text: the segment's span is
+    divided among the words in proportion to their character length -
+    karaoke sweeps stay plausible without re-transcribing anything."""
+    toks = text.split()
+    if not toks:
+        return []
+    total = sum(len(t) for t in toks) or 1
+    words = []
+    t = float(start)
+    for i, tok in enumerate(toks):
+        w_end = float(end) if i == len(toks) - 1 else t + (end - start) * len(tok) / total
+        words.append({
+            "start": round(t, 3), "end": round(w_end, 3),
+            "word": (" " + tok) if i else tok, "probability": 1.0,
+        })
+        t = w_end
+    return words
+
+
+def apply_lyric_edits(transcript: dict, edits: list[dict],
+                      win_lo: float, win_hi: float) -> dict:
+    """Replace the segments inside [win_lo, win_hi] with user-edited
+    lines ([{start, end, text}]). Pure data edit - timings come from the
+    original segments, word timings are redistributed over each edited
+    line's text, and Whisper is never involved. Returns a new dict."""
+    kept = [s for s in transcript.get("segments", [])
+            if not (win_lo - 1e-6 <= (s["start"] + s["end"]) / 2.0 <= win_hi + 1e-6)]
+    new_segs = []
+    for e in edits:
+        text = (e.get("text") or "").strip()
+        start, end = float(e["start"]), float(e["end"])
+        if end <= start:
+            continue
+        new_segs.append({
+            "id": 0, "start": round(start, 3), "end": round(end, 3),
+            "text": text, "words": _words_for_text(text, start, end),
+        })
+    merged = sorted(kept + new_segs, key=lambda s: s["start"])
+    for i, s in enumerate(merged):
+        s["id"] = i
+    out = dict(transcript)
+    out["segments"] = merged
     return out
 
 

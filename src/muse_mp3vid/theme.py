@@ -64,15 +64,16 @@ MODE_CATALOG: list[dict] = [
     {"name": "bubbles",   "family": "sparse"},
     {"name": "laserfan",  "family": "bass"},
     {"name": "gears",     "family": "balanced"},
+    {"name": "pomterrain", "family": "balanced"},
 ]
 MODES = {m["name"]: i for i, m in enumerate(MODE_CATALOG)}
 FAMILIES: dict[str, list[str]] = {}
 for _m in MODE_CATALOG:
     FAMILIES.setdefault(_m["family"], []).append(_m["name"])
 # every family can also borrow the balanced pool - variety beats purity
-FAMILIES["bass"] += ["radial", "mandala", "orbital"]
-FAMILIES["bright"] += ["radial", "sunburst", "ledwall"]
-FAMILIES["sparse"] += ["radial", "waterfall", "terrain"]
+FAMILIES["bass"] += ["radial", "mandala", "orbital", "pomterrain"]
+FAMILIES["bright"] += ["radial", "sunburst", "ledwall", "pomterrain"]
+FAMILIES["sparse"] += ["radial", "waterfall", "terrain", "pomterrain"]
 
 _COVER_NAMES = ("cover", "folder", "front", "album", "artwork")
 _COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
@@ -147,7 +148,7 @@ def palette_from_audio(mean_spectrum: np.ndarray) -> list[list[float]]:
     for i in range(5):
         t = i / 4
         hue = (base_hue + (top_hue - base_hue) * t) % 1.0
-        r, g, b = colorsys.hls_to_rgb(hue, 0.22 + 0.38 * t, 0.85)
+        r, g, b = colorsys.hls_to_rgb(hue, 0.22 + 0.38 * t, 0.55)
         colors.append([round(r, 4), round(g, 4), round(b, 4)])
     return colors
 
@@ -242,6 +243,7 @@ def mode_params(mode_name: str, stats: dict, spin: float) -> list[float]:
         "laserfan":  [5 + onset / 25, spin, bass, bright],          # beams
         "gears":     [6 + bass * 8, spin, bright, flux * 8],        # teeth
         "waterfall": [spin, bass, bright, 40 + flux * 60],          # scroll rows
+        "pomterrain": [spin, bass, 0.75 + bass * 0.45, 30 + flux * 45],  # depth, history span
         "terrain":   [spin, bass, bright, 5 + flux * 20],
         "plasma":    [4 + bass * 4, spin, bright, flux * 8],        # blobs
         "scope":     [spin, bass, bright, 2 + flux * 30],           # traces
@@ -400,6 +402,12 @@ def build_theme(
                                     hook["start"], hook["end"])
         schedule = build_schedule(FAMILIES[family], seed, bounds,
                                   hook["end"] - hook["start"], stats, spin)
+        # The opening section is always the hero: a lit, POM-raymarched
+        # FFT terrain. Flat pattern modes read as data plots; this is the
+        # one that looks like a place.
+        schedule[0] = {**schedule[0], "mode": MODES["pomterrain"],
+                       "mode_name": "pomterrain",
+                       "params": mode_params("pomterrain", stats, spin)}
     else:
         name = FAMILIES[family][seed % len(FAMILIES[family])]
         schedule = [{
